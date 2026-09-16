@@ -498,7 +498,13 @@ function Module.Function:TeleportToGun()
 
     SetPosition(Root, Gun.Position + vector.create(0, GunPickupHeight, 0))
 
-    if ReturnTo then
+    if not ReturnTo then
+        Module.Stored.Grabbing = false
+        return
+    end
+
+    -- Severe: task.wait is only legal inside task.spawn / task.delay, not a UI callback.
+    task.spawn(function()
         task.wait()
 
         local CurrentRoot = GetRoot()
@@ -511,9 +517,9 @@ function Module.Function:TeleportToGun()
                 Camera.CFrame = CameraCFrame
             end)
         end
-    end
 
-    Module.Stored.Grabbing = false
+        Module.Stored.Grabbing = false
+    end)
 end
 
 function Module.Function:RefreshWorld()
