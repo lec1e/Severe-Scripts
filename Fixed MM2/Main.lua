@@ -25,8 +25,7 @@ local GetBoundingBox = _G.GetBoundingBox
 
 local CollectSpeed = 20
 local CollectRange = 200
-local GunPickupHeight = 3
-local ReturnDelay = 0.4
+local GunPickupHeight = 1
 local RoleFontSize = 13
 local RoleFont = "Verdana"
 
@@ -49,6 +48,8 @@ local Module = {
         Gun = nil,
         OldPosition = nil,
         Grabbing = false,
+        ScanningGun = false,
+        MapWatch = {},
     },
 }
 
@@ -98,7 +99,11 @@ local function CopyPosition(Value)
     if not Value then
         return nil
     end
-    return vector.create(Value.X, Value.Y, Value.Z)
+    return vector.create(
+        Value.X or Value.x or 0,
+        Value.Y or Value.y or 0,
+        Value.Z or Value.z or 0
+    )
 end
 
 -- Helper docs: only the native BasePart.Position setter actually moves a simulated
@@ -125,6 +130,24 @@ local function EachPlayer(Callback)
     end
 end
 
+local function IsAlive(Object)
+    local Ok, Parent = pcall(function()
+        return Object.Parent
+    end)
+    return Ok and Parent ~= nil
+end
+
+local function IsGunDrop(Object)
+    if not Object then
+        return false
+    end
+
+    local Ok, Name = pcall(function()
+        return Object.Name
+    end)
+    return Ok and Name == "GunDrop"
+end
+
 function Module.Function:GetMap()
     for _, Child in Workspace:GetChildren() do
         if Child.ClassName == "Model" and Child:FindFirstChild("CoinContainer") then
@@ -135,7 +158,130 @@ end
 
 function Module.Function:GetGun()
     local Map = Module.Stored.Map
-    return Map and Map:FindFirstChild("GunDrop")
+    if not Map then
+        return
+    end
+
+    local Ok, Kids = pcall(function()
+        return Map:GetChildren()
+    end)
+    if not Ok then
+        return
+    end
+
+    for _, Object in Kids do
+        if IsGunDrop(Object) then
+            return Object
+        end
+    end
+end
+
+function Module.Function:SetGun(Gun)
+    if Gun and not IsAlive(Gun) then
+        Gun = nil
+    end
+
+    Module.Stored.Gun = Gun
+
+    if Flag("Auto Grab Gun") and Gun and not Module.Stored.Grabbing and not self:PlayerHasGun() then
+        self:TeleportToGun()
+    end
+end
+
+function Module.Function:ScanGunAsync()
+    if Module.Stored.ScanningGun then
+        return
+    end
+    Module.Stored.ScanningGun = true
+
+    task.spawn(function()
+        local Map = Module.Stored.Map
+        local Found = self:GetGun()
+
+        if not Found and Map then
+            local Ok, Descendants = pcall(function()
+                return Map:GetDescendants()
+            end)
+            if Ok then
+                for Index, Object in Descendants do
+                    if IsGunDrop(Object) then
+                        Found = Object
+                        break
+                    end
+                    if Index % 40 == 0 then
+                        task.wait()
+                    end
+                end
+            end
+        end
+
+        if Found then
+            self:SetGun(Found)
+        elseif not IsAlive(Module.Stored.Gun) then
+            Module.Stored.Gun = nil
+        end
+
+        Module.Stored.ScanningGun = false
+    end)
+end
+
+function Module.Function:HookMap(Map)
+    for _, Connection in Module.Stored.MapWatch do
+        pcall(function()
+            Connection:Disconnect()
+        end)
+    end
+    Module.Stored.MapWatch = {}
+
+    if not Map then
+        Module.Stored.Gun = nil
+        return
+    end
+
+    local function OnAdded(Object)
+        if IsGunDrop(Object) then
+            self:SetGun(Object)
+        end
+    end
+
+    local function OnRemoved(Object)
+        if Object == Module.Stored.Gun or IsGunDrop(Object) then
+            Module.Stored.Gun = nil
+            self:ScanGunAsync()
+        end
+    end
+
+    local function Connect(Signal, Callback)
+        local Ok, Connection = pcall(function()
+            return Signal:Connect(Callback)
+        end)
+        if Ok and Connection then
+            table.insert(Module.Stored.MapWatch, Connection)
+        end
+    end
+
+    Connect(Map.ChildAdded, OnAdded)
+    Connect(Map.ChildRemoved, OnRemoved)
+    Connect(Map.DescendantAdded, OnAdded)
+    Connect(Map.DescendantRemoving, OnRemoved)
+
+    self:ScanGunAsync()
+end
+
+function Module.Function:WatchGun()
+    pcall(function()
+        Workspace.ChildAdded:Connect(function(Object)
+            if Object.ClassName == "Model" and Object:FindFirstChild("CoinContainer") then
+                Module.Stored.Map = Object
+                self:HookMap(Object)
+            elseif IsGunDrop(Object) then
+                self:SetGun(Object)
+            end
+        end)
+    end)
+
+    Module.Stored.Map = self:GetMap()
+    self:HookMap(Module.Stored.Map)
 end
 
 function Module.Function:GetCoinCount()
@@ -254,13 +400,20 @@ function Module.Function:RenderGun()
     end
 
     local Gun = Module.Stored.Gun
+    if not IsAlive(Gun) then
+        Module.Stored.Gun = nil
+        Gun = nil
+    end
+
     local Camera = Workspace.CurrentCamera
     if not Gun or not Camera then
         return
     end
 
-    local Screen, OnScreen = Camera:WorldToScreenPoint(Gun.Position)
-    if not OnScreen then
+    local Ok, Screen, OnScreen = pcall(function()
+        return Camera:WorldToScreenPoint(Gun.Position)
+    end)
+    if not Ok or not OnScreen then
         return
     end
 
@@ -308,30 +461,21 @@ function Module.Function:PlayerHasGun()
         or self:FindRole(LocalPlayer:FindFirstChild("Backpack")) == Roles.Gun
 end
 
-function Module.Function:WaitForGunPickup(DroppedGun)
-    local Deadline = os.clock() + math.max(ReturnDelay, 0.75)
-
-    while os.clock() < Deadline do
-        task.wait(0.05)
-
-        if self:PlayerHasGun() then
-            return true
-        end
-
-        if not DroppedGun or not DroppedGun.Parent then
-            return true
-        end
-    end
-
-    return self:PlayerHasGun()
-end
-
 function Module.Function:TeleportToGun()
     if Module.Stored.Grabbing then
         return
     end
 
     local Gun = Module.Stored.Gun
+    if not IsAlive(Gun) then
+        Gun = self:GetGun()
+        if Gun then
+            self:SetGun(Gun)
+        else
+            self:ScanGunAsync()
+        end
+    end
+
     local Root = GetRoot()
     if not Gun or not Root or self:PlayerHasGun() then
         return
@@ -340,33 +484,46 @@ function Module.Function:TeleportToGun()
     Module.Stored.Grabbing = true
 
     local ReturnTo = nil
+    local Camera = Workspace.CurrentCamera
+    local CameraCFrame = nil
     if Flag("Position Track") then
         ReturnTo = CopyPosition(Root.Position)
         Module.Stored.OldPosition = ReturnTo
+        if Camera then
+            pcall(function()
+                CameraCFrame = Camera.CFrame
+            end)
+        end
     end
 
     SetPosition(Root, Gun.Position + vector.create(0, GunPickupHeight, 0))
 
     if ReturnTo then
-        task.spawn(function()
-            self:WaitForGunPickup(Gun)
-            task.wait(0.05)
+        task.wait()
 
-            local CurrentRoot = GetRoot()
-            if CurrentRoot then
-                SetPosition(CurrentRoot, ReturnTo)
-            end
+        local CurrentRoot = GetRoot()
+        if CurrentRoot then
+            SetPosition(CurrentRoot, ReturnTo)
+        end
 
-            Module.Stored.Grabbing = false
-        end)
-    else
-        Module.Stored.Grabbing = false
+        if Camera and CameraCFrame then
+            pcall(function()
+                Camera.CFrame = CameraCFrame
+            end)
+        end
     end
+
+    Module.Stored.Grabbing = false
 end
 
 function Module.Function:RefreshWorld()
-    Module.Stored.Map = self:GetMap()
-    Module.Stored.Gun = self:GetGun()
+    local Map = self:GetMap()
+    if Map ~= Module.Stored.Map then
+        Module.Stored.Map = Map
+        self:HookMap(Map)
+    elseif not IsAlive(Module.Stored.Gun) then
+        self:ScanGunAsync()
+    end
 
     if Flag("Auto Grab Gun") and Module.Stored.Gun and not Module.Stored.Grabbing and not self:PlayerHasGun() then
         self:TeleportToGun()
@@ -463,7 +620,7 @@ AutofarmSection:Toggle({ Name = "Full Bag Suicide", Flag = "Full Bag Suicide", D
 
 ExploitsSection:Toggle({ Name = "Auto Grab Gun", Flag = "Auto Grab Gun", Default = false })
 ExploitsSection:Separator()
-ExploitsSection:Toggle({ Name = "Position Track", Flag = "Position Track", Default = false })
+ExploitsSection:Toggle({ Name = "Position Track", Flag = "Position Track", Default = true })
 ExploitsSection:Button({
     Name = "Teleport To Gun",
     Callback = function()
@@ -473,6 +630,8 @@ ExploitsSection:Button({
 
 Library:Watermark("Gunkin-Ware")
 Library:NavigationBar(Library.Windows[1], Library:StyleWindow(), Library:ConfigWindow())
+
+Module.Function:WatchGun()
 
 task.spawn(function()
     Module.Function:CollectLoop()
