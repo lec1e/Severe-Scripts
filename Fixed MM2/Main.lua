@@ -4,12 +4,24 @@ local RunService = game:GetService("RunService")
 
 local LocalPlayer = Players.LocalPlayer
 
-local Library = loadstring(game:HttpGet("https://raw.githubusercontent.com/lec1e/Severe-Scripts/refs/heads/main/Fixed%20MM2/UI%20Library/UI%20Source.lua"))()
+local function HttpGet(Url)
+    local Body = http.get({ url = Url })
+    if type(Body) == "buffer" then
+        local Ok, Text = pcall(buffer.tostring, Body)
+        if Ok then
+            return Text
+        end
+    end
+    return Body
+end
+
+local Library = loadstring(HttpGet("https://raw.githubusercontent.com/lec1e/Severe-Scripts/refs/heads/main/Fixed%20MM2/UI%20Library/UI%20Source.lua"))()
 task.wait(2)
-loadstring(game:HttpGet("https://raw.githubusercontent.com/lec1e/Severe-Scripts/refs/heads/main/Fixed%20MM2/Module/Helper.lua"))()
+loadstring(HttpGet("https://raw.githubusercontent.com/lec1e/Severe-Scripts/refs/heads/main/Fixed%20MM2/Module/Helper.lua"))()
 task.wait(2)
 
 local TweenService = _G.TweenService
+local GetBoundingBox = _G.GetBoundingBox
 
 local CollectSpeed = 20
 local CollectRange = 200
@@ -24,10 +36,10 @@ local Roles = {
 }
 
 local BoxCorners = {
-    Vector3.new(-0.5, -0.5, -0.5), Vector3.new(-0.5, -0.5, 0.5),
-    Vector3.new(-0.5,  0.5, -0.5), Vector3.new(-0.5,  0.5, 0.5),
-    Vector3.new( 0.5, -0.5, -0.5), Vector3.new( 0.5, -0.5, 0.5),
-    Vector3.new( 0.5,  0.5, -0.5), Vector3.new( 0.5,  0.5, 0.5),
+    { -0.5, -0.5, -0.5 }, { -0.5, -0.5, 0.5 },
+    { -0.5,  0.5, -0.5 }, { -0.5,  0.5, 0.5 },
+    {  0.5, -0.5, -0.5 }, {  0.5, -0.5, 0.5 },
+    {  0.5,  0.5, -0.5 }, {  0.5,  0.5, 0.5 },
 }
 
 local Module = {
@@ -51,6 +63,20 @@ local function FlagColor(Name)
     return Value.Color, Value.Alpha
 end
 
+local function ToDrawColor(Color)
+    if type(Color) == "vector" then
+        return Color
+    end
+    if Color and Color.R ~= nil then
+        return vector.create(Color.R, Color.G, Color.B)
+    end
+    return vector.create(1, 1, 1)
+end
+
+local function ToScreen(Point)
+    return vector.create(Point.X, Point.Y)
+end
+
 local function GetRoot(Character)
     Character = Character or LocalPlayer.Character
     return Character and Character:FindFirstChild("HumanoidRootPart")
@@ -58,16 +84,24 @@ end
 
 local function GetHumanoid(Character)
     Character = Character or LocalPlayer.Character
-    return Character and Character:FindFirstChildOfClass("Humanoid")
+    return Character and Character:FindFirstChild("Humanoid")
 end
 
 local function Distance(A, B)
     return vector.magnitude(A - B)
 end
 
+local function EachPlayer(Callback)
+    for _, Player in Players:GetChildren() do
+        if Player.ClassName == "Player" then
+            Callback(Player)
+        end
+    end
+end
+
 function Module.Function:GetMap()
     for _, Child in Workspace:GetChildren() do
-        if Child:IsA("Model") and Child:FindFirstChild("CoinContainer") then
+        if Child.ClassName == "Model" and Child:FindFirstChild("CoinContainer") then
             return Child
         end
     end
@@ -75,10 +109,7 @@ end
 
 function Module.Function:GetGun()
     local Map = Module.Stored.Map
-    if not Map then
-        return
-    end
-    return Map:FindFirstChild("GunDrop")
+    return Map and Map:FindFirstChild("GunDrop")
 end
 
 function Module.Function:GetCoinCount()
@@ -134,17 +165,39 @@ function Module.Function:CheckRole(Player)
     return self:FindRole(Character) or self:FindRole(Player:FindFirstChild("Backpack"))
 end
 
+function Module.Function:CharacterBox(Character)
+    local Ok, Box, Size = pcall(function()
+        return Character:GetBoundingBox()
+    end)
+    if Ok and Size and Size.Y > 0 then
+        return Box, Size
+    end
+
+    if GetBoundingBox then
+        Ok, Box, Size = pcall(GetBoundingBox, Character)
+        if Ok and Size and Size.Y > 0 then
+            return Box, Size
+        end
+    end
+end
+
 function Module.Function:WorldBoxToScreen(Center, Size)
     local Camera = Workspace.CurrentCamera
     if not Camera then
         return 0, 0, 0, 0, false
     end
 
+    local Origin = Center.Position or Center
     local MinX, MinY, MaxX, MaxY = math.huge, math.huge, -math.huge, -math.huge
     local OnScreen = false
 
     for _, Corner in BoxCorners do
-        local Screen, Visible = Camera:WorldToScreenPoint(Center + Corner * Size)
+        local World = vector.create(
+            Origin.X + Corner[1] * Size.X,
+            Origin.Y + Corner[2] * Size.Y,
+            Origin.Z + Corner[3] * Size.Z
+        )
+        local Screen, Visible = Camera:WorldToScreenPoint(World)
         MinX = math.min(MinX, Screen.X)
         MaxX = math.max(MaxX, Screen.X)
         MinY = math.min(MinY, Screen.Y)
@@ -158,7 +211,15 @@ function Module.Function:WorldBoxToScreen(Center, Size)
 end
 
 function Module.Function:DrawLabel(Position, Color, Alpha, Text)
-    DrawingImmediate.OutlinedText(Position, RoleFontSize, Color, Alpha, Text, true, RoleFont)
+    DrawingImmediate.OutlinedText(
+        ToScreen(Position),
+        RoleFontSize,
+        ToDrawColor(Color),
+        Alpha or 1,
+        Text,
+        true,
+        RoleFont
+    )
 end
 
 function Module.Function:RenderGun()
@@ -188,29 +249,27 @@ function Module.Function:RenderRoles()
         return
     end
 
-    for _, Player in Players:GetPlayers() do
+    EachPlayer(function(Player)
         if Player == LocalPlayer then
-            continue
+            return
         end
 
         local Role = self:CheckRole(Player)
         local Character = Player.Character
         if not Role or not Character then
-            continue
+            return
         end
 
-        local Ok, Box, Size = pcall(function()
-            return Character:GetBoundingBox()
-        end)
-        if not Ok or not Size or Size.Y <= 0 then
-            continue
+        local Box, Size = self:CharacterBox(Character)
+        if not Box then
+            return
         end
 
-        local MinX, MinY, MaxX, MaxY, OnScreen = self:WorldBoxToScreen(Box.Position, Size)
+        local MinX, MinY, MaxX, MaxY, OnScreen = self:WorldBoxToScreen(Box, Size)
         if OnScreen then
-            self:DrawLabel(Vector2.new((MinX + MaxX) / 2, MaxY + 1), Role.Color, Role.Alpha, Role.Name)
+            self:DrawLabel(vector.create((MinX + MaxX) / 2, MaxY + 1), Role.Color, Role.Alpha, Role.Name)
         end
-    end
+    end)
 end
 
 function Module.Function:Render()
@@ -229,7 +288,7 @@ function Module.Function:TeleportToGun()
         Module.Stored.OldPosition = Root.Position
     end
 
-    Root.Position = Gun.Position + Vector3.new(0, GunPickupHeight, 0)
+    Root.Position = Gun.Position + vector.create(0, GunPickupHeight, 0)
 
     if Flag("Position Track") and Module.Stored.OldPosition then
         local ReturnTo = Module.Stored.OldPosition
@@ -267,7 +326,7 @@ function Module.Function:CollectLoop()
         end
 
         local Root = GetRoot()
-        if not Root or not Module.Stored.Map then
+        if not Root or not Module.Stored.Map or not TweenService then
             task.wait()
             continue
         end
@@ -303,7 +362,7 @@ function Module.Function:CollectLoop()
     end
 end
 
-local Window = Library:Window({ Name = "Goop | Murder Mystery 2", Size = Vector2.new(550, 600) })
+local Window = Library:Window({ Name = "Gunkin-Ware | Murder Mystery 2", Size = Vector2.new(550, 600) })
 local MainTab = Window:Page({ Name = "Main", Columns = 2 })
 local VisualsSection = MainTab:Section({ Name = "Visuals", Side = 1 })
 local ExploitsSection = MainTab:Section({ Name = "Exploits", Side = 2 })
@@ -349,7 +408,7 @@ ExploitsSection:Button({
     end,
 })
 
-Library:Watermark("Goop")
+Library:Watermark("Gunkin-Ware")
 Library:NavigationBar(Library.Windows[1], Library:StyleWindow(), Library:ConfigWindow())
 
 task.spawn(function()
