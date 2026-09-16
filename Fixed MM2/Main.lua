@@ -48,6 +48,7 @@ local Module = {
         Map = nil,
         Gun = nil,
         OldPosition = nil,
+        Grabbing = false,
     },
 }
 
@@ -89,6 +90,31 @@ end
 
 local function Distance(A, B)
     return vector.magnitude(A - B)
+end
+
+-- Severe's native Position is a live memory view. Storing Root.Position and then
+-- writing Position updates that same value, so the "saved" spot becomes the gun.
+local function CopyPosition(Value)
+    if not Value then
+        return nil
+    end
+    return vector.create(Value.X, Value.Y, Value.Z)
+end
+
+-- Helper docs: only the native BasePart.Position setter actually moves a simulated
+-- part / local character. CFrame writes spin the rig; copy into vector.create first.
+local function SetPosition(Part, Position)
+    if not Part or not Position then
+        return
+    end
+
+    local Target = CopyPosition(Position)
+    Part.Position = Target
+
+    pcall(function()
+        Part.AssemblyLinearVelocity = vector.create(0, 0, 0)
+        Part.AssemblyAngularVelocity = vector.create(0, 0, 0)
+    end)
 end
 
 local function EachPlayer(Callback)
@@ -277,27 +303,64 @@ function Module.Function:Render()
     self:RenderRoles()
 end
 
+function Module.Function:PlayerHasGun()
+    return self:FindRole(LocalPlayer.Character) == Roles.Gun
+        or self:FindRole(LocalPlayer:FindFirstChild("Backpack")) == Roles.Gun
+end
+
+function Module.Function:WaitForGunPickup(DroppedGun)
+    local Deadline = os.clock() + math.max(ReturnDelay, 0.75)
+
+    while os.clock() < Deadline do
+        task.wait(0.05)
+
+        if self:PlayerHasGun() then
+            return true
+        end
+
+        if not DroppedGun or not DroppedGun.Parent then
+            return true
+        end
+    end
+
+    return self:PlayerHasGun()
+end
+
 function Module.Function:TeleportToGun()
-    local Gun = Module.Stored.Gun
-    local Root = GetRoot()
-    if not Gun or not Root then
+    if Module.Stored.Grabbing then
         return
     end
 
-    if Flag("Position Track") then
-        Module.Stored.OldPosition = Root.Position
+    local Gun = Module.Stored.Gun
+    local Root = GetRoot()
+    if not Gun or not Root or self:PlayerHasGun() then
+        return
     end
 
-    Root.Position = Gun.Position + vector.create(0, GunPickupHeight, 0)
+    Module.Stored.Grabbing = true
 
-    if Flag("Position Track") and Module.Stored.OldPosition then
-        local ReturnTo = Module.Stored.OldPosition
-        task.delay(ReturnDelay, function()
+    local ReturnTo = nil
+    if Flag("Position Track") then
+        ReturnTo = CopyPosition(Root.Position)
+        Module.Stored.OldPosition = ReturnTo
+    end
+
+    SetPosition(Root, Gun.Position + vector.create(0, GunPickupHeight, 0))
+
+    if ReturnTo then
+        task.spawn(function()
+            self:WaitForGunPickup(Gun)
+            task.wait(0.05)
+
             local CurrentRoot = GetRoot()
             if CurrentRoot then
-                CurrentRoot.Position = ReturnTo
+                SetPosition(CurrentRoot, ReturnTo)
             end
+
+            Module.Stored.Grabbing = false
         end)
+    else
+        Module.Stored.Grabbing = false
     end
 end
 
@@ -305,7 +368,7 @@ function Module.Function:RefreshWorld()
     Module.Stored.Map = self:GetMap()
     Module.Stored.Gun = self:GetGun()
 
-    if Flag("Auto Grab Gun") then
+    if Flag("Auto Grab Gun") and Module.Stored.Gun and not Module.Stored.Grabbing and not self:PlayerHasGun() then
         self:TeleportToGun()
     end
 end
