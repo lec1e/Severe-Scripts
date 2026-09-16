@@ -20,24 +20,40 @@ Drawing.RegisterFont("Source-Sans-Pro", 96, http.get({ url = "https://github.com
 
 local OffsetsHost = "https://offsets.imtheo.lol"
 
-local function HttpGetBody(Url)
-    local Ok, Response = pcall(function()
-        return game:HttpGet(Url)
-    end)
-    if Ok and type(Response) == "string" and #Response > 0 then
-        return Response
+local function ToBodyString(Value)
+    if type(Value) == "string" then
+        return Value
     end
+    if type(Value) == "buffer" then
+        local Ok, Text = pcall(buffer.tostring, Value)
+        if Ok and type(Text) == "string" then
+            return Text
+        end
+        return nil
+    end
+    if type(Value) == "table" then
+        return ToBodyString(Value.Body or Value.body or Value.Text or Value.text or Value.data)
+    end
+    return nil
+end
 
-    Ok, Response = pcall(function()
-        return http.get({ url = Url })
-    end)
-    if Ok and type(Response) == "string" and #Response > 0 then
-        return Response
-    end
-    if Ok and type(Response) == "table" then
-        local Body = Response.Body or Response.body or Response.Text or Response.text
-        if type(Body) == "string" and #Body > 0 then
-            return Body
+local function HttpGetBody(Url)
+    local Attempts = {
+        function()
+            return http.get({ url = Url })
+        end,
+        function()
+            return game:HttpGet(Url)
+        end,
+    }
+
+    for _, Request in Attempts do
+        local Ok, Response = pcall(Request)
+        if Ok then
+            local Body = ToBodyString(Response)
+            if type(Body) == "string" and #Body > 0 then
+                return Body
+            end
         end
     end
 
@@ -45,19 +61,22 @@ local function HttpGetBody(Url)
 end
 
 local function NormalizeVersion(Version)
-    if type(Version) ~= "string" then
+    if Version == nil then
         return nil
+    end
+    if type(Version) ~= "string" then
+        Version = tostring(Version)
     end
 
     Version = Version:match("^%s*(.-)%s*$") or Version
     Version = Version:match("[^\r\n]+") or Version
-    if Version == "" then
-        return nil
+
+    local Hash = Version:match("(version%-[%w]+)")
+    if Hash then
+        return Hash
     end
-    if not Version:find("^version%-") then
-        Version = "version-" .. Version
-    end
-    return Version
+
+    return nil
 end
 
 local function GetClientVersion()
@@ -65,7 +84,7 @@ local function GetClientVersion()
         return game:GetClientVersion()
     end)
     if Ok then
-        Version = NormalizeVersion(tostring(Version))
+        Version = NormalizeVersion(Version)
         if Version then
             return Version
         end
@@ -75,12 +94,22 @@ local function GetClientVersion()
 end
 
 local function DecodeJson(Body)
-    local Ok, Result = pcall(function()
-        return game:GetService("HttpService"):JSONDecode(Body)
-    end)
-    if Ok and type(Result) == "table" then
-        return Result
+    local Decoders = {
+        function()
+            return crypt.json.decode(Body)
+        end,
+        function()
+            return game:GetService("HttpService"):JSONDecode(Body)
+        end,
+    }
+
+    for _, Decode in Decoders do
+        local Ok, Result = pcall(Decode)
+        if Ok and type(Result) == "table" then
+            return Result
+        end
     end
+
     return nil
 end
 
