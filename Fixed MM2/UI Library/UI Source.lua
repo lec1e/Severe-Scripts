@@ -1,4 +1,3 @@
-
 local Library do
     local UserInputService = game:GetService("UserInputService")
     local Players = game:GetService("Players")
@@ -203,12 +202,17 @@ local Library do
     local PropCache = setmetatable({ }, { __mode = "k" })
 
     local function NewDrawing(Type, Properties)
-        local Object = Drawing.new(Type)
+        local Ok, Object = pcall(Drawing.new, Type)
+        if not Ok or not Object then
+            return nil
+        end
         local Cache = { }
         PropCache[Object] = Cache
         if Properties then
             for Key, Value in Properties do
-                Object[Key] = Value
+                pcall(function()
+                    Object[Key] = Value
+                end)
                 Cache[Key] = Value
             end
         end
@@ -216,6 +220,9 @@ local Library do
     end
 
     local function UpdateDrawing(Object, Properties)
+        if not Object then
+            return
+        end
         local Cache = PropCache[Object]
         if not Cache then
             Cache = { }
@@ -223,7 +230,9 @@ local Library do
         end
         for Key, Value in Properties do
             if Cache[Key] ~= Value then
-                Object[Key] = Value
+                pcall(function()
+                    Object[Key] = Value
+                end)
                 Cache[Key] = Value
             end
         end
@@ -257,15 +266,33 @@ local Library do
 
     -- // Draw Helpers \\ --
 
+    local MAX_SQUARES = 220
+    local MAX_TEXTS = 120
+    local MAX_IMAGES = 24
+
     local function DrawRect(X, Y, W, H, Color, Opacity)
+        W = MathFloor(tonumber(W) or 0)
+        H = MathFloor(tonumber(H) or 0)
+        X = tonumber(X) or 0
+        Y = tonumber(Y) or 0
+        if W < 1 or H < 1 or X ~= X or Y ~= Y then
+            return
+        end
+
         Pool.Order = Pool.Order + 1
         local Index = Pool.SquareCount + 1
+        if Index > MAX_SQUARES then
+            return
+        end
         Pool.SquareCount = Index
 
         local Square = Pool.Squares[Index]
         if not Square then
             Square = NewDrawing("Square", { Filled = true, Thickness = 1 })
             Pool.Squares[Index] = Square
+        end
+        if not Square then
+            return
         end
 
         UpdateDrawing(Square, {
@@ -279,14 +306,26 @@ local Library do
     end
 
     local function DrawText(X, Y, Size, Color, Text, Opacity, Center)
+        X = tonumber(X) or 0
+        Y = tonumber(Y) or 0
+        if X ~= X or Y ~= Y then
+            return
+        end
+
         Pool.Order = Pool.Order + 1
         local Index = Pool.TextCount + 1
+        if Index > MAX_TEXTS then
+            return
+        end
         Pool.TextCount = Index
 
         local Object = Pool.Texts[Index]
         if not Object then
             Object = NewDrawing("Text", { Outline = true, OutlineColor = OutlineColor })
             Pool.Texts[Index] = Object
+        end
+        if not Object then
+            return
         end
 
         UpdateDrawing(Object, {
@@ -316,6 +355,9 @@ local Library do
     local function DrawImage(X, Y, W, H, Data, Color, Opacity, ForcedZ)
         Pool.Order = Pool.Order + 1
         local Index = Pool.ImageCount + 1
+        if Index > MAX_IMAGES then
+            return
+        end
         Pool.ImageCount = Index
 
         local Object = Pool.Images[Index]
@@ -336,6 +378,11 @@ local Library do
     end
 
     local function DrawBox(X, Y, W, H, Outer, Border, Fill)
+        W = tonumber(W) or 0
+        H = tonumber(H) or 0
+        if W < 4 or H < 4 then
+            return
+        end
         DrawRect(X, Y, W, H, Outer)
         DrawRect(X + 1, Y + 1, W - 2, H - 2, Border)
         DrawRect(X + 2, Y + 2, W - 4, H - 4, Fill)
@@ -1108,13 +1155,21 @@ local Library do
         return TotalHeight + Library.Layout.SectionInnerPadding
     end
 
-    function Sections:Render(X, Y, Width)
+    function Sections:Render(X, Y, Width, MaxHeight)
         self.X, self.Y, self.Width = X, Y, Width
 
         local Padding = Library.Layout.SectionInnerPadding
         local HeaderHeight = Library.Layout.SectionHeaderHeight
+        local Wanted = self:GetContentHeight()
+        if type(MaxHeight) == "number" and MaxHeight > 0 then
+            self.Height = MathMin(Wanted, MaxHeight)
+        else
+            self.Height = Wanted
+        end
 
-        self.Height = self:GetContentHeight()
+        if Width < 4 or self.Height < 4 then
+            return
+        end
 
         DrawRect(X, Y, Width, self.Height, Theme["Border"])
         DrawRect(X + 1, Y + 1, Width - 2, self.Height - 2, Theme["Black"])
@@ -1126,9 +1181,8 @@ local Library do
         local CursorY = Y + HeaderHeight
         local InnerWidth = Width - Padding * 2
         local SectionRightEdge = CursorX + InnerWidth
+        local ClipBottom = Y + self.Height - Padding
 
-        -- Pickers attached directly to the section render as their own left-aligned
-        -- row below the header, lining up with where Toggles begin.
         if self.AttachedKeyPicker or #self.AttachedColorPickers > 0 then
             local RowH = Library.Layout.SectionPickerRowHeight
             local BadgeY = CursorY + MathFloor((RowH - 13) / 2)
@@ -1138,6 +1192,9 @@ local Library do
 
         for _, Element in self.Elements do
             if not Element.Hidden then
+                if CursorY + Element.Height > ClipBottom then
+                    break
+                end
                 Element.X, Element.Y, Element.Width = CursorX, CursorY, InnerWidth
                 Element.SectionRightEdge = SectionRightEdge
                 Element:Render()
@@ -1168,21 +1225,6 @@ local Library do
     end
 
     function Pages:Section(Data)
-        -- A page holds at most 2 *regular* sections; extras fold into the last one.
-        -- MultiSection/ScrollableSection entries (and MultiSection sub-sections) are
-        -- registered in self.Sections too, so they're excluded from the count and the
-        -- fold target — otherwise a :Section after a :MultiSection would fold into the
-        -- wrong object.
-        local RegularCount, LastRegular = 0, nil
-        for _, Section in self.Sections do
-            if not Section.MultiSection and not Section.IsMultiSection and not Section.Scrollable then
-                RegularCount = RegularCount + 1
-                LastRegular = Section
-            end
-        end
-        if RegularCount >= 2 then
-            return LastRegular
-        end
         return CreateSection(self, Data or { })
     end
 
@@ -1207,22 +1249,34 @@ local Library do
             X = 0, Y = 0, Width = 0, Height = 0,
         }, Sections)
 
-        function Section:Render(X, Y, Width)
+        function Section:Render(X, Y, Width, MaxHeight)
             self.X, self.Y, self.Width = X, Y, Width
-            self.Height = self.Size
+            local Size = self.Size or 175
+            if type(MaxHeight) == "number" and MaxHeight > 0 then
+                Size = MathMin(Size, MaxHeight)
+            end
+            Size = MathMax(Size, Library.Layout.SectionHeaderHeight + 8)
+            self.Height = Size
+
+            if Width < 4 or Size < 4 then
+                return
+            end
 
             local Padding = Library.Layout.SectionInnerPadding
             local HeaderHeight = Library.Layout.SectionHeaderHeight
 
-            DrawRect(X, Y, Width, self.Size, Theme["Border"])
-            DrawRect(X + 1, Y + 1, Width - 2, self.Size - 2, Theme["Black"])
-            DrawRect(X + 2, Y + 2, Width - 4, self.Size - 4, Theme["Dark Background"])
+            DrawRect(X, Y, Width, Size, Theme["Border"])
+            DrawRect(X + 1, Y + 1, Width - 2, Size - 2, Theme["Black"])
+            DrawRect(X + 2, Y + 2, Width - 4, Size - 4, Theme["Dark Background"])
             DrawRect(X + 2, Y + 2, Width - 4, 2, Theme["Accent"])
             DrawText(X + 5, Y + 6, Library.FontSize, Theme["White"], self.Name)
 
             local ContentTop = Y + HeaderHeight
-            local ContentBottom = Y + self.Size - Padding
+            local ContentBottom = Y + Size - Padding
             local ViewHeight = ContentBottom - ContentTop
+            if ViewHeight < 1 then
+                return
+            end
 
             local ContentHeight = 0
             for _, Element in self.Elements do
@@ -1319,7 +1373,7 @@ local Library do
             self.Sections[#self.Sections + 1] = Sub
         end
 
-        function Multi:Render(X, Y, Width)
+        function Multi:Render(X, Y, Width, MaxHeight)
             self.X, self.Y, self.Width = X, Y, Width
 
             local Padding = Library.Layout.SectionInnerPadding
@@ -1335,6 +1389,12 @@ local Library do
             end
 
             self.Height = TabRowHeight + ContentHeight + Padding
+            if type(MaxHeight) == "number" and MaxHeight > 0 then
+                self.Height = MathMin(self.Height, MaxHeight)
+            end
+            if Width < 4 or self.Height < 4 then
+                return
+            end
 
             -- Frame. The content fill spans everything, so the active tab (which
             -- keeps this fill) blends straight into the panel below it.
@@ -1385,6 +1445,9 @@ local Library do
 
             for _, Element in ActiveSection.Elements do
                 if not Element.Hidden then
+                    if CursorY + Element.Height > Y + self.Height - Padding then
+                        break
+                    end
                     Element.X, Element.Y, Element.Width = CursorX, CursorY, InnerWidth
                     Element.SectionRightEdge = SectionRightEdge
                     Element:Render()
@@ -1402,6 +1465,14 @@ local Library do
         local Pad = Library.Layout.SectionPadding
         local MiddleGap = Library.Layout.SectionMiddleGap
         local ColumnWidth = MathFloor((Width - Pad * 2 - (Columns - 1) * MiddleGap) / Columns)
+        if ColumnWidth < 8 then
+            return
+        end
+
+        local PageBottom = Y + (Height or 0)
+        if not Height or Height <= 0 then
+            PageBottom = Y + 10000
+        end
 
         local ColumnCursorY = { }
         for Col = 1, Columns do
@@ -1409,14 +1480,17 @@ local Library do
         end
 
         for _, Section in self.Sections do
-            -- MultiSection sub-sections are drawn by their container, not directly.
             if not Section.MultiSection then
                 local Col = MathClamp(Section.Side or 1, 1, Columns)
                 local ColX = X + Pad + (Col - 1) * (ColumnWidth + MiddleGap)
                 local SecY = ColumnCursorY[Col]
+                local Remain = PageBottom - Pad - SecY
+                if Remain < 20 then
+                    continue
+                end
 
-                Section:Render(ColX, SecY, ColumnWidth)
-                ColumnCursorY[Col] = SecY + Section.Height + Library.Layout.SectionGap
+                Section:Render(ColX, SecY, ColumnWidth, Remain)
+                ColumnCursorY[Col] = SecY + (Section.Height or 0) + Library.Layout.SectionGap
             end
         end
     end
