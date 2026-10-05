@@ -1,4 +1,3 @@
-
 local Library do
     local UserInputService = game:GetService("UserInputService")
     local Players = game:GetService("Players")
@@ -69,24 +68,20 @@ local Library do
         Folders = {
             Directory = "Goop",
             Files = "Goop/Files",
-            Fonts = "Goop/Files/Fonts",
-            Images = "Goop/Files/Images",
             Configs = "Goop/" .. tostring(game.GameId) .. "/Configs",
         },
 
         Fonts = {
-            Data = {List = {}, Fonts = {}},
-            Stored = {
-                {"ProggyClean.ttf",       "ProggyClean.json",       "https://github.com/lec1e/Severe-UI-Libraries/raw/refs/heads/main/fonts/ProggyClean.ttf"},
-                {"Minecraftia.ttf",       "Minecraftia.json",       "https://github.com/lec1e/Severe-UI-Libraries/raw/refs/heads/main/fonts/Minecraftia.ttf"},
-                {"Verdana.ttf",           "Verdana.json",           "https://github.com/lec1e/Severe-UI-Libraries/raw/refs/heads/main/fonts/Verdana.ttf"},
-                {"Visitor.ttf",           "Visitor.json",           "https://github.com/lec1e/Severe-UI-Libraries/raw/refs/heads/main/fonts/Visitor.ttf"},
-                {"SmallestPixel.ttf",     "SmallestPixel.json",     "https://github.com/lec1e/Severe-UI-Libraries/raw/refs/heads/main/fonts/SmallestPixel.ttf"},
-                {"Windows-XP-Tahoma.ttf", "Windows-XP-Tahoma.json", "https://github.com/lec1e/Severe-UI-Libraries/raw/refs/heads/main/fonts/Windows-XP-Tahoma.ttf"},
-                {"Monaco.ttf",            "Monaco.json",            "https://github.com/lec1e/Severe-UI-Libraries/raw/refs/heads/main/fonts/Monaco.ttf"},
+            Data = {
+                List = { "Viga", "Proggy", "Avant" },
+                Fonts = { },
             },
         }
     }
+
+    for _, Name in Library.Fonts.Data.List do
+        Library.Fonts.Data.Fonts[Name] = true
+    end
 
     Library.Camera = Camera
     Library.Viewport = Camera.ViewportSize * Library.DPIScale
@@ -151,69 +146,26 @@ local Library do
         end
     end
 
-    local function LoadFonts()
-        for _, FontData in pairs(Library.Fonts.Stored) do
-            local Name, Url = FontData[1]:match("([^%.]+)"), FontData[3]
-            local TTFPath = Library.Folders.Fonts .. "/" .. Name .. ".bin"
-
-            if not fs.file(TTFPath) then
-                local Body = http.get({ url = Url })
-                fs.write(TTFPath, Body)
-            end
-
-            local Data = fs.read(TTFPath)
-            Drawing.RegisterFont(Name, 13, Data)
-
-            Library.Fonts.Data.Fonts[Name] = true
-            table.insert(Library.Fonts.Data.List, Name)
-        end
-    end
-
-    LoadFonts()
-
     Library.FontSize = 13
-    Library.Font = Library.Fonts.Data.Fonts["Verdana"] and "Verdana" or Library.Fonts.Data.List[1]
-
-    -- // Icons \\ --
-
-    local IconUrls = {
-        Home = "https://raw.githubusercontent.com/lec1e/Severe-UI-Libraries/refs/heads/main/assets/goop/Home.png",
-        Style = "https://raw.githubusercontent.com/lec1e/Severe-UI-Libraries/refs/heads/main/assets/goop/Style.png",
-        Config = "https://raw.githubusercontent.com/lec1e/Severe-UI-Libraries/refs/heads/main/assets/goop/Config.png",
-    }
-
-    Library.Icons = { }
-
-    local function LoadIcons()
-        for Name, Url in pairs(IconUrls) do
-            local ImagePath = Library.Folders.Images .. "/" .. Name .. ".png"
-
-            if not fs.file(ImagePath) then
-                fs.write(ImagePath, http.get({ url = Url }))
-            end
-
-            Library.Icons[Name] = fs.read(ImagePath)
-        end
-    end
-
-    LoadIcons()
+    Library.Font = "Avant"
 
     -- // Core \\ --
-    local OutlineColor = Vector3.new(0, 0, 0)
+    local OutlineColor = vector.create(0, 0, 0)
     local PropCache = setmetatable({ }, { __mode = "k" })
 
+    local Constructors = {
+        Square = Square,
+        Text = Text,
+    }
+
     local function NewDrawing(Type, Properties)
-        local Ok, Object = pcall(Drawing.new, Type)
-        if not Ok or not Object then
-            return nil
-        end
+        local Class = Constructors[Type]
+        local Object = Class and Class.new() or Drawing.new(Type)
         local Cache = { }
         PropCache[Object] = Cache
         if Properties then
             for Key, Value in Properties do
-                pcall(function()
-                    Object[Key] = Value
-                end)
+                Object[Key] = Value
                 Cache[Key] = Value
             end
         end
@@ -221,9 +173,6 @@ local Library do
     end
 
     local function UpdateDrawing(Object, Properties)
-        if not Object then
-            return
-        end
         local Cache = PropCache[Object]
         if not Cache then
             Cache = { }
@@ -231,159 +180,434 @@ local Library do
         end
         for Key, Value in Properties do
             if Cache[Key] ~= Value then
-                pcall(function()
-                    Object[Key] = Value
-                end)
+                Object[Key] = Value
                 Cache[Key] = Value
             end
         end
     end
 
-    local Pool = {
-        Squares = { }, SquareCount = 0,
-        Texts = { }, TextCount = 0,
-        Images = { }, ImageCount = 0,
-        Order = 0,
-    }
+    -- // Drawing Scopes \\ --
+    -- Every window, section, element and overlay owns its own set of drawings
+    -- (a "scope"). A drawing stays bound to the same thing on screen, so each
+    -- frame only the properties that actually changed get written; opening,
+    -- closing or changing one window never reshuffles another window's drawings.
+    --
+    -- Drawings are never created while rendering: scopes take pre-made, hidden
+    -- drawings from a shared reserve, which the Drawing loop keeps topped up.
 
-    function Pool:Begin()
-        self.SquareCount = 0
-        self.TextCount = 0
-        self.ImageCount = 0
-        self.Order = 0
+    local Reserve = { Square = { }, Text = { } }
+    local ReserveTarget = { Square = 256, Text = 96 } -- spare drawings kept ready
+    local InitialReserve = { Square = 1536, Text = 384 } -- created once at load
+
+    local function MakeReserveDrawing(Kind)
+        if Kind == "Square" then
+            return NewDrawing("Square", { Filled = true, Thickness = 1, Visible = false })
+        end
+        return NewDrawing("Text", { Outline = true, OutlineColor = OutlineColor, Visible = false })
     end
 
-    function Pool:Finish()
-        for Index = self.SquareCount + 1, #self.Squares do
-            UpdateDrawing(self.Squares[Index], { Visible = false })
+    local function TakeDrawing(Kind)
+        local List = Reserve[Kind]
+        local Count = #List
+        if Count == 0 then return nil end
+        local Object = List[Count]
+        List[Count] = nil
+        return Object
+    end
+
+    local Scopes = { }       -- Owner -> Scope
+    local ScopeList = { }    -- every live Scope
+    local ScopeStack = { }
+    local ScopeDepth = 0
+    local CurrentScope = nil
+
+    Library.FrameId = 0
+    Library.FrameTime = 0
+
+    local function GetScope(Owner)
+        local Scope = Scopes[Owner]
+        if not Scope then
+            Scope = {
+                Owner = Owner,
+                Squares = { }, SquareCount = 0,
+                Texts = { }, TextCount = 0,
+                Order = 0, Base = 0,
+                Frame = -1, LastUsed = 0,
+                Hidden = true,
+            }
+            Scopes[Owner] = Scope
+            ScopeList[#ScopeList + 1] = Scope
         end
-        for Index = self.TextCount + 1, #self.Texts do
-            UpdateDrawing(self.Texts[Index], { Visible = false })
+        return Scope
+    end
+
+    -- Begins drawing into Owner's scope. ZBase keeps layering stable: things that
+    -- never overlap (e.g. the elements of one window) share a band, so their
+    -- ZIndex values don't shift when something else appears or disappears.
+    local function PushScope(Owner, ZBase)
+        local Scope = GetScope(Owner)
+        Scope.SquareCount, Scope.TextCount, Scope.Order = 0, 0, 0
+        Scope.Base = ZBase or 0
+        Scope.Frame = Library.FrameId
+        Scope.LastUsed = Library.FrameTime
+        Scope.Hidden = false
+
+        ScopeDepth = ScopeDepth + 1
+        ScopeStack[ScopeDepth] = CurrentScope or false
+        CurrentScope = Scope
+    end
+
+    -- Hides a drawing without allocating a property table.
+    local function HideDrawing(Object)
+        local Cache = PropCache[Object]
+        if Cache.Visible ~= false then
+            Object.Visible = false
+            Cache.Visible = false
         end
-        for Index = self.ImageCount + 1, #self.Images do
-            UpdateDrawing(self.Images[Index], { Visible = false })
+    end
+
+    -- Ends the current scope: anything it drew last frame but not this frame is hidden.
+    local function PopScope()
+        local Scope = CurrentScope
+        if Scope then
+            local Squares, Texts = Scope.Squares, Scope.Texts
+            for Index = Scope.SquareCount + 1, #Squares do
+                HideDrawing(Squares[Index])
+            end
+            for Index = Scope.TextCount + 1, #Texts do
+                HideDrawing(Texts[Index])
+            end
         end
+        local Previous = ScopeStack[ScopeDepth]
+        ScopeStack[ScopeDepth] = nil
+        ScopeDepth = MathMax(ScopeDepth - 1, 0)
+        CurrentScope = Previous or nil
+    end
+
+    local function ResetScopeStack()
+        table.clear(ScopeStack)
+        ScopeDepth = 0
+        CurrentScope = nil
+    end
+
+    -- Runs Callback inside Owner's scope, keeping the scope stack balanced even
+    -- if the callback returns early.
+    local function WithScope(Owner, ZBase, Callback, ...)
+        PushScope(Owner, ZBase)
+        Callback(...)
+        PopScope()
+    end
+
+    local function HideScope(Scope)
+        for _, Object in Scope.Squares do
+            HideDrawing(Object)
+        end
+        for _, Object in Scope.Texts do
+            HideDrawing(Object)
+        end
+        Scope.Hidden = true
+    end
+
+    -- Hides scopes nobody drew last frame (closed windows, other tabs, culled
+    -- elements), a limited number of drawings per tick so a big window closing
+    -- is spread over a few frames. Scopes unused for a while give their
+    -- drawings back to the reserve.
+    local LastRelease = 0
+
+    local function SweepScopes()
+        local Budget = 384
+        local Stale = Library.FrameId - 1
+        for _, Scope in ScopeList do
+            if not Scope.Hidden and Scope.Frame < Stale then
+                if Budget <= 0 then break end
+                Budget = Budget - (#Scope.Squares + #Scope.Texts)
+                HideScope(Scope)
+            end
+        end
+
+        local Now = Library.FrameTime
+        if Now - LastRelease < 2 then return end
+        LastRelease = Now
+
+        local Kept = { }
+        for _, Scope in ScopeList do
+            if Scope.Hidden and Now - Scope.LastUsed > 10 then
+                for _, Object in Scope.Squares do
+                    Reserve.Square[#Reserve.Square + 1] = Object
+                end
+                for _, Object in Scope.Texts do
+                    Reserve.Text[#Reserve.Text + 1] = Object
+                end
+                Scopes[Scope.Owner] = nil
+            else
+                Kept[#Kept + 1] = Scope
+            end
+        end
+        ScopeList = Kept
     end
 
     -- // Draw Helpers \\ --
 
-    local MAX_SQUARES = 220
-    local MAX_TEXTS = 120
-    local MAX_IMAGES = 24
+    -- Vertical clip region, set only while a page renders (see Pages:Render).
+    -- Retained drawings have no real clipping, so rects are trimmed to the
+    -- region, text outside it is skipped, and elements are culled whole.
+    local ClipTop, ClipBottom = nil, nil
 
     local function DrawRect(X, Y, W, H, Color, Opacity)
-        W = MathFloor(tonumber(W) or 0)
-        H = MathFloor(tonumber(H) or 0)
-        X = tonumber(X) or 0
-        Y = tonumber(Y) or 0
-        if W < 1 or H < 1 or X ~= X or Y ~= Y then
-            return
+        local Scope = CurrentScope
+        if not Scope then return end
+        -- Skip degenerate rects (NaN or non-positive size).
+        if X ~= X or Y ~= Y or W ~= W or H ~= H or W <= 0 or H <= 0 then return end
+
+        if ClipTop then
+            if Y < ClipTop then
+                H = H - (ClipTop - Y)
+                Y = ClipTop
+            end
+            if Y + H > ClipBottom then
+                H = ClipBottom - Y
+            end
+            if H <= 0 then return end
         end
 
-        Pool.Order = Pool.Order + 1
-        local Index = Pool.SquareCount + 1
-        if Index > MAX_SQUARES then
-            return
-        end
-        Pool.SquareCount = Index
+        Scope.Order = Scope.Order + 1
+        local Index = Scope.SquareCount + 1
+        Scope.SquareCount = Index
 
-        local Square = Pool.Squares[Index]
+        local Square = Scope.Squares[Index]
         if not Square then
-            Square = NewDrawing("Square", { Filled = true, Thickness = 1 })
-            Pool.Squares[Index] = Square
-        end
-        if not Square then
-            return
+            Square = TakeDrawing("Square")
+            if not Square then return end -- reserve empty; the Drawing loop refills it
+            Scope.Squares[Index] = Square
         end
 
-        UpdateDrawing(Square, {
-            Visible = true,
-            Position = Vector2New(X, Y),
-            Size = Vector2New(W, H),
-            Color = Color,
-            Opacity = Opacity or 1,
-            ZIndex = Pool.Order,
-        })
+        -- Compare raw numbers so Position/Size are only written when they change.
+        local Cache = PropCache[Square]
+        if Cache.X ~= X or Cache.Y ~= Y then
+            Square.Position = Vector2New(X, Y)
+            Cache.X, Cache.Y = X, Y
+        end
+        if Cache.W ~= W or Cache.H ~= H then
+            Square.Size = Vector2New(W, H)
+            Cache.W, Cache.H = W, H
+        end
+
+        -- Direct comparisons instead of UpdateDrawing: no property table is
+        -- allocated per call, so an unchanged frame produces no garbage.
+        Opacity = Opacity or 1
+        local ZIndex = Scope.Base + Scope.Order
+        if Cache.Visible ~= true then Square.Visible = true; Cache.Visible = true end
+        if Cache.Color ~= Color then Square.Color = Color; Cache.Color = Color end
+        if Cache.Opacity ~= Opacity then Square.Opacity = Opacity; Cache.Opacity = Opacity end
+        if Cache.ZIndex ~= ZIndex then Square.ZIndex = ZIndex; Cache.ZIndex = ZIndex end
     end
 
     local function DrawText(X, Y, Size, Color, Text, Opacity, Center)
-        X = tonumber(X) or 0
-        Y = tonumber(Y) or 0
-        if X ~= X or Y ~= Y then
-            return
-        end
+        local Scope = CurrentScope
+        if not Scope then return end
+        if X ~= X or Y ~= Y then return end
+        if ClipTop and (Y < ClipTop or Y + (Size or Library.FontSize) > ClipBottom) then return end
 
-        Pool.Order = Pool.Order + 1
-        local Index = Pool.TextCount + 1
-        if Index > MAX_TEXTS then
-            return
-        end
-        Pool.TextCount = Index
+        Scope.Order = Scope.Order + 1
+        local Index = Scope.TextCount + 1
+        Scope.TextCount = Index
 
-        local Object = Pool.Texts[Index]
+        local Object = Scope.Texts[Index]
         if not Object then
-            Object = NewDrawing("Text", { Outline = true, OutlineColor = OutlineColor })
-            Pool.Texts[Index] = Object
-        end
-        if not Object then
-            return
+            Object = TakeDrawing("Text")
+            if not Object then return end
+            Scope.Texts[Index] = Object
         end
 
-        UpdateDrawing(Object, {
-            Visible = true,
-            Position = Vector2New(X, Y),
-            Size = Size,
-            Color = Color,
-            Text = Text,
-            Center = Center or false,
-            Opacity = Opacity or 1,
-            Font = Library.Font,
-            ZIndex = Pool.Order,
-        })
+        local Cache = PropCache[Object]
+        if Cache.X ~= X or Cache.Y ~= Y then
+            Object.Position = Vector2New(X, Y)
+            Cache.X, Cache.Y = X, Y
+        end
+
+        Text = tostring(Text or "")
+        Center = Center or false
+        Opacity = Opacity or 1
+        local Font = Library.Font
+        local ZIndex = Scope.Base + Scope.Order
+        if Cache.Visible ~= true then Object.Visible = true; Cache.Visible = true end
+        -- Font and Size before Text, so a change doesn't lay the text out twice.
+        if Cache.Font ~= Font then Object.Font = Font; Cache.Font = Font end
+        if Cache.Size ~= Size then Object.Size = Size; Cache.Size = Size end
+        if Cache.Text ~= Text then Object.Text = Text; Cache.Text = Text end
+        if Cache.Color ~= Color then Object.Color = Color; Cache.Color = Color end
+        if Cache.Center ~= Center then Object.Center = Center; Cache.Center = Center end
+        if Cache.Opacity ~= Opacity then Object.Opacity = Opacity; Cache.Opacity = Opacity end
+        if Cache.ZIndex ~= ZIndex then Object.ZIndex = ZIndex; Cache.ZIndex = ZIndex end
     end
+
+    -- // Text Measuring \\ --
+    -- Measuring text by setting it on a Text object and reading TextBounds straight
+    -- back can return a previous string's size, because the native side updates
+    -- later. That made labels drift off-centre and the watermark flick thin. Now:
+    --   * GetTextBounds returns a cached, verified size when it has one. For a
+    --     string it hasn't measured yet it returns an estimate (from the average
+    --     character width of what it has measured) and queues a real measurement.
+    --   * Queued strings are measured with DrawingImmediate.GetTextBounds inside
+    --     RunService.Render (it's a DrawingImmediate function, so that's where it's
+    --     guaranteed to work). No instances are read there.
+    --   * If that isn't available or fails, hidden Text objects measure instead:
+    --     each is given one string, and its TextBounds is only trusted once it has
+    --     read the same value on two frames in a row.
 
     local MeasureText = NewDrawing("Text", { Visible = false })
 
+    local BoundsCache = { }
+    local BoundsCacheCount = 0
+    local PendingMeasure = { }   -- Key -> { Font, Size, Text, Assigned }
+    local PendingCount = 0
+    local FontMetrics = { }      -- "Font\0Size" -> { Chars, Width, Height }
+
+    local ImmediateMeasure = DrawingImmediate and DrawingImmediate.GetTextBounds
+    local ImmediateFailed = ImmediateMeasure == nil
+
+    local function MetricKey(Font, Size)
+        return tostring(Font) .. "\0" .. Size
+    end
+
+    local function ValidBounds(Bounds, Text)
+        return Bounds ~= nil and type(Bounds.X) == "number" and Bounds.X == Bounds.X
+            and (Text == "" or Bounds.X > 0)
+    end
+
+    local function StoreBounds(Key, Job, Bounds)
+        if BoundsCacheCount >= 2048 then
+            table.clear(BoundsCache)
+            BoundsCacheCount = 0
+        end
+        if not BoundsCache[Key] then
+            BoundsCacheCount = BoundsCacheCount + 1
+        end
+        BoundsCache[Key] = Bounds
+
+        if PendingMeasure[Key] then
+            PendingMeasure[Key] = nil
+            PendingCount = PendingCount - 1
+        end
+
+        local Text = Job[3]
+        if #Text > 0 then
+            local MKey = MetricKey(Job[1], Job[2])
+            local Metrics = FontMetrics[MKey]
+            if not Metrics then
+                Metrics = { Chars = 0, Width = 0, Height = 0 }
+                FontMetrics[MKey] = Metrics
+            end
+            if Metrics.Chars < 4096 then
+                Metrics.Chars = Metrics.Chars + #Text
+                Metrics.Width = Metrics.Width + Bounds.X
+            end
+            Metrics.Height = Bounds.Y
+        end
+    end
+
+    local function EstimateBounds(Font, Size, Text)
+        local Metrics = FontMetrics[MetricKey(Font, Size)]
+        if Metrics and Metrics.Chars > 0 then
+            return Vector2New(#Text * Metrics.Width / Metrics.Chars, Metrics.Height)
+        end
+        return Vector2New(#Text * Size * 0.5, Size)
+    end
+
     local function GetTextBounds(Text, Size)
-        UpdateDrawing(MeasureText, {
-            Text = tostring(Text),
-            Size = Size or Library.FontSize,
-            Font = Library.Font,
-        })
-        return MeasureText.TextBounds
-    end
+        Text = tostring(Text)
+        Size = Size or Library.FontSize
+        local Font = Library.Font
 
-    local function DrawImage(X, Y, W, H, Data, Color, Opacity, ForcedZ)
-        Pool.Order = Pool.Order + 1
-        local Index = Pool.ImageCount + 1
-        if Index > MAX_IMAGES then
-            return
-        end
-        Pool.ImageCount = Index
-
-        local Object = Pool.Images[Index]
-        if not Object then
-            Object = NewDrawing("Image", { })
-            Pool.Images[Index] = Object
+        local Key = MetricKey(Font, Size) .. "\0" .. Text
+        local Cached = BoundsCache[Key]
+        if Cached then
+            return Cached
         end
 
-        UpdateDrawing(Object, {
-            Visible = true,
-            Position = Vector2New(X, Y),
-            Size = Vector2New(W, H),
-            Data = Data,
-            Color = Color or Theme["White"],
-            Opacity = Opacity or 1,
-            ZIndex = ForcedZ or Pool.Order,
-        })
+        if not PendingMeasure[Key] and PendingCount < 512 then
+            PendingMeasure[Key] = { Font, Size, Text, false }
+            PendingCount = PendingCount + 1
+        end
+
+        return EstimateBounds(Font, Size, Text)
     end
+
+    -- Measures everything queued, via DrawingImmediate (called from RunService.Render).
+    function Library.MeasurePendingImmediate()
+        if ImmediateFailed or PendingCount == 0 then return end
+
+        for Key, Job in PendingMeasure do
+            local Ok, Bounds = pcall(ImmediateMeasure, Job[1], Job[2], Job[3])
+            if Ok and ValidBounds(Bounds, Job[3]) then
+                StoreBounds(Key, Job, Vector2New(Bounds.X, Bounds.Y))
+            else
+                -- Not usable here; switch to the Text-object measurers for good.
+                ImmediateFailed = true
+                return
+            end
+        end
+    end
+
+    -- Fallback measurers (called once per interface frame).
+    local Measurers = { { Object = MeasureText } }
+    for Index = 2, 8 do
+        Measurers[Index] = { Object = NewDrawing("Text", { Visible = false }) }
+    end
+
+    function Library.MeasurePendingFallback()
+        if not ImmediateFailed then return end
+
+        local Frame = Library.FrameId
+        for _, Measurer in Measurers do
+            local Job = Measurer.Job
+            if Job then
+                if PendingMeasure[Measurer.Key] ~= Job then
+                    Measurer.Job, Measurer.Key, Measurer.LastX = nil, nil, nil
+                elseif Frame - Measurer.SetFrame >= 1 then
+                    local Bounds = Measurer.Object.TextBounds
+                    if ValidBounds(Bounds, Job[3]) and Bounds.X == Measurer.LastX and Bounds.Y == Measurer.LastY then
+                        StoreBounds(Measurer.Key, Job, Vector2New(Bounds.X, Bounds.Y))
+                        Measurer.Job, Measurer.Key, Measurer.LastX = nil, nil, nil
+                    elseif Bounds then
+                        Measurer.LastX, Measurer.LastY = Bounds.X, Bounds.Y
+                    end
+                end
+            end
+
+            if not Measurer.Job and PendingCount > 0 then
+                for Key, Pending in PendingMeasure do
+                    if not Pending[4] then
+                        Pending[4] = true
+                        Measurer.Job, Measurer.Key, Measurer.SetFrame = Pending, Key, Frame
+                        Measurer.LastX, Measurer.LastY = nil, nil
+                        UpdateDrawing(Measurer.Object, { Font = Pending[1], Size = Pending[2], Text = Pending[3] })
+                        break
+                    end
+                end
+            end
+        end
+    end
+
+    -- ZIndex bands. Within a window: chrome < sections < elements < popups.
+    local Z = {
+        Watermark = 10000,
+        GroupRanked = 20000,
+        KeybindList = 30000,
+        WindowStart = 100000, WindowStep = 20000,
+        Section = 2000,
+        Element = 4000,
+        Dropdown = 15000,
+        Snap = 900000,
+        Notifications = 910000,
+        ContextMenu = 930000,
+        ColorPicker = 940000,
+        NavBar = 950000,
+    }
+    Library.ZBands = Z
+    Library.CurrentWindowZ = 0
 
     local function DrawBox(X, Y, W, H, Outer, Border, Fill)
-        W = tonumber(W) or 0
-        H = tonumber(H) or 0
-        if W < 4 or H < 4 then
-            return
-        end
         DrawRect(X, Y, W, H, Outer)
         DrawRect(X + 1, Y + 1, W - 2, H - 2, Border)
         DrawRect(X + 2, Y + 2, W - 4, H - 4, Fill)
@@ -486,6 +710,10 @@ local Library do
 
     function Library:IsHovering(X, Y, Width, Height)
         local Input = self.Input
+        -- Anything clipped out of the current page can't be hovered or clicked.
+        if ClipTop and (Input.MouseY < ClipTop or Input.MouseY > ClipBottom) then
+            return false
+        end
         return Input.MouseX >= X and Input.MouseX <= X + Width
             and Input.MouseY >= Y and Input.MouseY <= Y + Height
     end
@@ -1010,6 +1238,20 @@ local Library do
 
         function Label:SyncFlag() end
 
+        -- Changes the Label's text. Attached pickers keep showing the new name
+        -- in the Keybinds list.
+        function Label:SetText(Text)
+            Text = tostring(Text or "")
+            self.Name = Text
+
+            for _, Picker in self.AttachedColorPickers do
+                Picker.HostName = Text
+            end
+            if self.AttachedKeyPicker then
+                self.AttachedKeyPicker.HostName = Text
+            end
+        end
+
         function Label:Render()
             local X, Y = self.X, self.Y
             local AnchorRight = self.SectionRightEdge or (X + self.Width)
@@ -1143,6 +1385,34 @@ local Library do
         return AttachKeyPicker(Host, self, Data)
     end
 
+    -- Renders one element of a section at CursorY, unless it isn't fully inside
+    -- the current clip region (page scroll) or the optional ViewTop/ViewBottom
+    -- (a ScrollableSection's own view). Elements are never drawn partially.
+    -- A dropdown or key-picker menu belonging to a culled element is closed so it
+    -- can't linger at a stale position.
+    local function RenderSectionElement(Element, CursorX, CursorY, InnerWidth, RightEdge, ViewTop, ViewBottom)
+        local Bottom = CursorY + Element.Height
+        local Visible = (not ViewTop or (CursorY >= ViewTop and Bottom <= ViewBottom))
+            and (not ClipTop or (CursorY >= ClipTop and Bottom <= ClipBottom))
+
+        if Visible then
+            Element.X, Element.Y, Element.Width = CursorX, CursorY, InnerWidth
+            Element.SectionRightEdge = RightEdge
+            WithScope(Element, Library.CurrentWindowZ + Z.Element, Element.Render, Element)
+            return
+        end
+
+        if Library.ActiveDropdown == Element then
+            Element.Open = false
+            Library.ActiveDropdown = nil
+        end
+        local Context = Library.KeyPickerContext
+        if Context and (Context.Element == Element or Context.Element == Element.AttachedKeyPicker) then
+            Context.Element.ContextOpen = false
+            Library.KeyPickerContext = nil
+        end
+    end
+
     function Sections:GetContentHeight()
         local TotalHeight = Library.Layout.SectionHeaderHeight
         if self.AttachedKeyPicker or #self.AttachedColorPickers > 0 then
@@ -1156,21 +1426,13 @@ local Library do
         return TotalHeight + Library.Layout.SectionInnerPadding
     end
 
-    function Sections:Render(X, Y, Width, MaxHeight)
+    function Sections:Render(X, Y, Width)
         self.X, self.Y, self.Width = X, Y, Width
 
         local Padding = Library.Layout.SectionInnerPadding
         local HeaderHeight = Library.Layout.SectionHeaderHeight
-        local Wanted = self:GetContentHeight()
-        if type(MaxHeight) == "number" and MaxHeight > 0 then
-            self.Height = MathMin(Wanted, MaxHeight)
-        else
-            self.Height = Wanted
-        end
 
-        if Width < 4 or self.Height < 4 then
-            return
-        end
+        self.Height = self:GetContentHeight()
 
         DrawRect(X, Y, Width, self.Height, Theme["Border"])
         DrawRect(X + 1, Y + 1, Width - 2, self.Height - 2, Theme["Black"])
@@ -1182,23 +1444,21 @@ local Library do
         local CursorY = Y + HeaderHeight
         local InnerWidth = Width - Padding * 2
         local SectionRightEdge = CursorX + InnerWidth
-        local ClipBottom = Y + self.Height - Padding
 
+        -- Pickers attached directly to the section render as their own left-aligned
+        -- row below the header, lining up with where Toggles begin.
         if self.AttachedKeyPicker or #self.AttachedColorPickers > 0 then
             local RowH = Library.Layout.SectionPickerRowHeight
-            local BadgeY = CursorY + MathFloor((RowH - 13) / 2)
-            RenderAttachedPickers(self, CursorX, BadgeY, true)
+            if not ClipTop or (CursorY >= ClipTop and CursorY + RowH <= ClipBottom) then
+                local BadgeY = CursorY + MathFloor((RowH - 13) / 2)
+                RenderAttachedPickers(self, CursorX, BadgeY, true)
+            end
             CursorY = CursorY + RowH
         end
 
         for _, Element in self.Elements do
             if not Element.Hidden then
-                if CursorY + Element.Height > ClipBottom then
-                    break
-                end
-                Element.X, Element.Y, Element.Width = CursorX, CursorY, InnerWidth
-                Element.SectionRightEdge = SectionRightEdge
-                Element:Render()
+                RenderSectionElement(Element, CursorX, CursorY, InnerWidth, SectionRightEdge)
                 CursorY = CursorY + Element.Height
             end
         end
@@ -1250,34 +1510,26 @@ local Library do
             X = 0, Y = 0, Width = 0, Height = 0,
         }, Sections)
 
-        function Section:Render(X, Y, Width, MaxHeight)
-            self.X, self.Y, self.Width = X, Y, Width
-            local Size = self.Size or 175
-            if type(MaxHeight) == "number" and MaxHeight > 0 then
-                Size = MathMin(Size, MaxHeight)
-            end
-            Size = MathMax(Size, Library.Layout.SectionHeaderHeight + 8)
-            self.Height = Size
+        function Section:GetContentHeight()
+            return self.Size
+        end
 
-            if Width < 4 or Size < 4 then
-                return
-            end
+        function Section:Render(X, Y, Width)
+            self.X, self.Y, self.Width = X, Y, Width
+            self.Height = self.Size
 
             local Padding = Library.Layout.SectionInnerPadding
             local HeaderHeight = Library.Layout.SectionHeaderHeight
 
-            DrawRect(X, Y, Width, Size, Theme["Border"])
-            DrawRect(X + 1, Y + 1, Width - 2, Size - 2, Theme["Black"])
-            DrawRect(X + 2, Y + 2, Width - 4, Size - 4, Theme["Dark Background"])
+            DrawRect(X, Y, Width, self.Size, Theme["Border"])
+            DrawRect(X + 1, Y + 1, Width - 2, self.Size - 2, Theme["Black"])
+            DrawRect(X + 2, Y + 2, Width - 4, self.Size - 4, Theme["Dark Background"])
             DrawRect(X + 2, Y + 2, Width - 4, 2, Theme["Accent"])
             DrawText(X + 5, Y + 6, Library.FontSize, Theme["White"], self.Name)
 
             local ContentTop = Y + HeaderHeight
-            local ContentBottom = Y + Size - Padding
+            local ContentBottom = Y + self.Size - Padding
             local ViewHeight = ContentBottom - ContentTop
-            if ViewHeight < 1 then
-                return
-            end
 
             local ContentHeight = 0
             for _, Element in self.Elements do
@@ -1297,11 +1549,7 @@ local Library do
             local CursorY = ContentTop - self.ScrollOffset
             for _, Element in self.Elements do
                 if not Element.Hidden then
-                    if CursorY >= ContentTop and CursorY + Element.Height <= ContentBottom then
-                        Element.X, Element.Y, Element.Width = CursorX, CursorY, InnerWidth
-                        Element.SectionRightEdge = SectionRightEdge
-                        Element:Render()
-                    end
+                    RenderSectionElement(Element, CursorX, CursorY, InnerWidth, SectionRightEdge, ContentTop, ContentBottom)
                     CursorY = CursorY + Element.Height
                 end
             end
@@ -1374,7 +1622,17 @@ local Library do
             self.Sections[#self.Sections + 1] = Sub
         end
 
-        function Multi:Render(X, Y, Width, MaxHeight)
+        function Multi:GetContentHeight()
+            local ContentHeight = 0
+            for _, Element in self.Tabs[self.Active].Elements do
+                if not Element.Hidden then
+                    ContentHeight = ContentHeight + Element.Height
+                end
+            end
+            return 28 + ContentHeight + Library.Layout.SectionInnerPadding
+        end
+
+        function Multi:Render(X, Y, Width)
             self.X, self.Y, self.Width = X, Y, Width
 
             local Padding = Library.Layout.SectionInnerPadding
@@ -1382,20 +1640,7 @@ local Library do
             local StripHeight = TabRowHeight - 4
 
             local ActiveSection = self.Tabs[self.Active]
-            local ContentHeight = 0
-            for _, Element in ActiveSection.Elements do
-                if not Element.Hidden then
-                    ContentHeight = ContentHeight + Element.Height
-                end
-            end
-
-            self.Height = TabRowHeight + ContentHeight + Padding
-            if type(MaxHeight) == "number" and MaxHeight > 0 then
-                self.Height = MathMin(self.Height, MaxHeight)
-            end
-            if Width < 4 or self.Height < 4 then
-                return
-            end
+            self.Height = self:GetContentHeight()
 
             -- Frame. The content fill spans everything, so the active tab (which
             -- keeps this fill) blends straight into the panel below it.
@@ -1446,12 +1691,7 @@ local Library do
 
             for _, Element in ActiveSection.Elements do
                 if not Element.Hidden then
-                    if CursorY + Element.Height > Y + self.Height - Padding then
-                        break
-                    end
-                    Element.X, Element.Y, Element.Width = CursorX, CursorY, InnerWidth
-                    Element.SectionRightEdge = SectionRightEdge
-                    Element:Render()
+                    RenderSectionElement(Element, CursorX, CursorY, InnerWidth, SectionRightEdge)
                     CursorY = CursorY + Element.Height
                 end
             end
@@ -1461,37 +1701,92 @@ local Library do
         return TableUnpack(Multi.Tabs)
     end
 
+    -- Sections stack top-to-bottom in their column (Side), in creation order,
+    -- SectionGap apart. Every section's height is measured before anything is
+    -- drawn, so positions never depend on the previous frame. If the tallest
+    -- column doesn't fit, the page scrolls: a thumb appears in the right-hand
+    -- padding (so column widths never change) and everything is clipped to the
+    -- page area.
+    local function SectionHeight(Section)
+        return Section:GetContentHeight()
+    end
+
     function Pages:Render(X, Y, Width, Height)
-        local Columns = self.Columns
+        local Columns = MathMax(1, self.Columns)
         local Pad = Library.Layout.SectionPadding
+        local Gap = Library.Layout.SectionGap
         local MiddleGap = Library.Layout.SectionMiddleGap
         local ColumnWidth = MathFloor((Width - Pad * 2 - (Columns - 1) * MiddleGap) / Columns)
-        if ColumnWidth < 8 then
-            return
-        end
 
-        local PageBottom = Y + (Height or 0)
-        if not Height or Height <= 0 then
-            PageBottom = Y + 10000
-        end
+        local ViewTop = Y + Pad
+        local ViewBottom = Y + Height - Pad
+        local ViewHeight = ViewBottom - ViewTop
 
-        local ColumnCursorY = { }
+        -- Pass 1: lay out every section (column + offset from the top of the view).
+        local Layout = { }
+        local ColumnHeight = { }
         for Col = 1, Columns do
-            ColumnCursorY[Col] = Y + Pad
+            ColumnHeight[Col] = 0
         end
 
         for _, Section in self.Sections do
+            -- MultiSection sub-sections are drawn by their container, not directly.
             if not Section.MultiSection then
                 local Col = MathClamp(Section.Side or 1, 1, Columns)
-                local ColX = X + Pad + (Col - 1) * (ColumnWidth + MiddleGap)
-                local SecY = ColumnCursorY[Col]
-                local Remain = PageBottom - Pad - SecY
-                if Remain >= 20 then
-                    Section:Render(ColX, SecY, ColumnWidth, Remain)
-                    ColumnCursorY[Col] = SecY + (Section.Height or 0) + Library.Layout.SectionGap
+                local Offset = ColumnHeight[Col]
+                if Offset > 0 then
+                    Offset = Offset + Gap
                 end
+                local SecHeight = SectionHeight(Section)
+                Layout[#Layout + 1] = { Section = Section, Col = Col, Offset = Offset }
+                ColumnHeight[Col] = Offset + SecHeight
             end
         end
+
+        local ContentHeight = 0
+        for Col = 1, Columns do
+            ContentHeight = MathMax(ContentHeight, ColumnHeight[Col])
+        end
+
+        -- Page scroll (only when the tallest column overflows).
+        local MaxScroll = MathMax(0, ContentHeight - ViewHeight)
+        self.ScrollOffset = MathClamp(self.ScrollOffset or 0, 0, MaxScroll)
+        if MaxScroll == 0 then
+            self.ScrollDragging = false
+        else
+            local TrackX = X + Width - 5
+            local ThumbHeight = MathMax(20, MathFloor(ViewHeight * (ViewHeight / ContentHeight)))
+
+            if Library.Input.MouseClicked and not Library.Input.Consumed and Library:IsHovering(TrackX - 2, ViewTop, 8, ViewHeight) then
+                self.ScrollDragging = true
+                Library.Input.Consumed = true
+            end
+            if not Library.Input.MouseDown then self.ScrollDragging = false end
+            if self.ScrollDragging then
+                local Fraction = MathClamp((Library.Input.MouseY - ViewTop - ThumbHeight / 2) / MathMax(1, ViewHeight - ThumbHeight), 0, 1)
+                self.ScrollOffset = MathFloor(Fraction * MaxScroll + 0.5)
+            end
+
+            local ThumbY = ViewTop + MathFloor((ViewHeight - ThumbHeight) * (self.ScrollOffset / MaxScroll))
+            local Hovered = self.ScrollDragging or Library:IsHovering(TrackX - 2, ThumbY, 8, ThumbHeight)
+            DrawRect(TrackX, ViewTop, 3, ViewHeight, Theme["Black"])
+            DrawRect(TrackX, ThumbY, 3, ThumbHeight, Hovered and Theme["Accent"] or Theme["Border"])
+        end
+
+        -- Pass 2: draw, clipped to the page view.
+        ClipTop, ClipBottom = ViewTop, ViewBottom
+        for _, Entry in Layout do
+            local Section = Entry.Section
+            local ColX = X + Pad + (Entry.Col - 1) * (ColumnWidth + MiddleGap)
+            local SecY = ViewTop + Entry.Offset - self.ScrollOffset
+            WithScope(Section, Library.CurrentWindowZ + Z.Section, Section.Render, Section, ColX, SecY, ColumnWidth)
+        end
+        ClipTop, ClipBottom = nil, nil
+    end
+
+    -- Clears the page clip region (used if a render errors part-way through).
+    Library.ResetClip = function()
+        ClipTop, ClipBottom = nil, nil
     end
 
     -- // Windows \\ --
@@ -1733,6 +2028,9 @@ local Library do
     end
 
     function WindowClass:Render()
+        -- Each window runs in its own task, so the dropdown overlay is per window.
+        Library.DropdownOverlay = nil
+
         -- Consume clicks that land inside an open colorpicker window.
         if Library.ActiveColorPicker and Library.ActiveColorPicker.LastRect and Library.Input.MouseClicked then
             local Rect = Library.ActiveColorPicker.LastRect
@@ -1849,6 +2147,7 @@ local Library do
 
         -- Dropdown overlay (drawn above everything else on this window).
         if Library.DropdownOverlay then
+            PushScope(self.OverlayKey, Library.CurrentWindowZ + Z.Dropdown)
             local Overlay = Library.DropdownOverlay
             local Element = Overlay.Element
             local OX, OY, OW = Overlay.X, Overlay.Y, Overlay.Width
@@ -1941,9 +2240,18 @@ local Library do
                 DrawRect(TrackX, TrackY, 3, TrackH, Theme["Black"])
                 DrawRect(TrackX, ThumbY, 3, ThumbH, ThumbHovered and Theme["Accent"] or Theme["Border"])
             end
+            PopScope()
         end
 
-        -- KeyPicker right-click context menu (Toggle / Hold mode).
+        if Library.Input.MouseClicked and Library.ActiveDropdown and Library.ActiveDropdown.Open and not Library.Input.Consumed then
+            Library.ActiveDropdown.Open = false
+            Library.ActiveDropdown = nil
+        end
+    end
+
+    -- KeyPicker right-click context menu (Toggle / Hold mode). Rendered once per
+    -- frame by the overlay task instead of by every visible window.
+    function Library:RenderKeyPickerContext()
         if Library.KeyPickerContext then
             local Keypicker = Library.KeyPickerContext.Element
             local MX = Library.KeyPickerContext.X
@@ -1985,12 +2293,6 @@ local Library do
             end
         end
 
-        Library:RenderColorPicker()
-
-        if Library.Input.MouseClicked and Library.ActiveDropdown and Library.ActiveDropdown.Open and not Library.Input.Consumed then
-            Library.ActiveDropdown.Open = false
-            Library.ActiveDropdown = nil
-        end
     end
 
     function Library:Window(Data)
@@ -2024,88 +2326,105 @@ local Library do
         end
 
         Library.Windows[#Library.Windows + 1] = Window
+        Window.ZBase = Library.ZBands.WindowStart + #Library.Windows * Library.ZBands.WindowStep
+        Window.OverlayKey = { }
+        Window.SnapKey = { }
+        if Library.StartWindowTask then
+            Library.StartWindowTask(Window)
+        end
 
-        RunService.PostLocal:Connect(function()
-            local PressedKeys = getpressedkeys() or { }
-            local function IsKeyPressed(Target) return TableFind(PressedKeys, Target) ~= nil end
+        -- Input is library-wide, so it's hooked once (by the first window) rather
+        -- than once per window, which ran every keybind/keypicker check and
+        -- callback several times per tick. Connect returns nothing to disconnect,
+        -- so the handler checks Library.Unloaded instead.
+        if not Library.InputHooked then
+            Library.InputHooked = true
+            RunService.PostLocal:Connect(function()
+                if Library.Unloaded then return end
 
-            if Library.CapturingKeyPicker then
-                local Keypicker = Library.CapturingKeyPicker
-                if IsKeyPressed("Escape") then
-                    Keypicker.Capturing = false
-                    Library.CapturingKeyPicker = nil
-                else
-                    if tick() - Keypicker.CapturingTime >= 0.4 then
-                        for _, Key in PressedKeys do
-                            if Key ~= "LeftButton" and Key ~= "RightButton" and Key ~= "MB1" and Key ~= "MB2" and Key ~= "" and Key ~= "Escape" then
-                                Keypicker.BoundKey = Key
-                                Keypicker.Capturing = false
-                                Keypicker:SyncFlag()
-                                Library.CapturingKeyPicker = nil
-                                break
+                local PressedKeys = getpressedkeys() or { }
+                local function IsKeyPressed(Target) return TableFind(PressedKeys, Target) ~= nil end
+
+                if Library.CapturingKeyPicker then
+                    local Keypicker = Library.CapturingKeyPicker
+                    if IsKeyPressed("Escape") then
+                        Keypicker.Capturing = false
+                        Library.CapturingKeyPicker = nil
+                    else
+                        if tick() - Keypicker.CapturingTime >= 0.4 then
+                            for _, Key in PressedKeys do
+                                if Key ~= "LeftButton" and Key ~= "RightButton" and Key ~= "MB1" and Key ~= "MB2" and Key ~= "" and Key ~= "Escape" then
+                                    Keypicker.BoundKey = Key
+                                    Keypicker.Capturing = false
+                                    Keypicker:SyncFlag()
+                                    Library.CapturingKeyPicker = nil
+                                    break
+                                end
                             end
                         end
                     end
                 end
-            end
 
-            for _, Keybind in Window.Keybinds do
-                if IsKeyPressed(Keybind.Code) then
-                    if not (Window.KeybindPreviousStates[Keybind.Key] or false) then
-                        if Keybind.Element.Type == "Toggle" then
-                            Keybind.Element.Value = not Keybind.Element.Value
-                            Keybind.Element:SyncFlag()
-                            Keybind.Element.Callback(Keybind.Element.Value)
+                for _, Window in Library.Windows do
+                    for _, Keybind in Window.Keybinds do
+                        if IsKeyPressed(Keybind.Code) then
+                            if not (Window.KeybindPreviousStates[Keybind.Key] or false) then
+                                if Keybind.Element.Type == "Toggle" then
+                                    Keybind.Element.Value = not Keybind.Element.Value
+                                    Keybind.Element:SyncFlag()
+                                    Keybind.Element.Callback(Keybind.Element.Value)
+                                end
+                                Window.KeybindPreviousStates[Keybind.Key] = true
+                            end
+                        else
+                            Window.KeybindPreviousStates[Keybind.Key] = nil
                         end
-                        Window.KeybindPreviousStates[Keybind.Key] = true
                     end
-                else
-                    Window.KeybindPreviousStates[Keybind.Key] = nil
                 end
-            end
 
-            for _, Keypicker in Library.Input.ActiveKeyPickers do
-                if Keypicker.BoundKey ~= "None" then
-                    local TE = Keypicker.ToggleElement
-                    local KeyIsActive = IsKeyPressed(Keypicker.BoundKey)
+                for _, Keypicker in Library.Input.ActiveKeyPickers do
+                    if Keypicker.BoundKey ~= "None" then
+                        local TE = Keypicker.ToggleElement
+                        local KeyIsActive = IsKeyPressed(Keypicker.BoundKey)
 
-                    if Keypicker.Mode == "Toggle" then
-                        if KeyIsActive and not (Keypicker.PrevPressed or false) then
+                        if Keypicker.Mode == "Toggle" then
+                            if KeyIsActive and not (Keypicker.PrevPressed or false) then
+                                if TE then
+                                    if Keypicker.HasCallback then
+                                        Keypicker.Callback(not TE.Value)
+                                    else
+                                        TE.Value = not TE.Value
+                                        TE:SyncFlag()
+                                        TE.Callback(TE.Value)
+                                    end
+                                else
+                                    Keypicker.ToggledState = not (Keypicker.ToggledState or false)
+                                    if Keypicker.HasCallback then
+                                        Keypicker.Callback(Keypicker.ToggledState)
+                                    end
+                                end
+                                Keypicker.PrevPressed = true
+                            elseif not KeyIsActive then
+                                Keypicker.PrevPressed = false
+                            end
+
+                        elseif Keypicker.Mode == "Hold" then
                             if TE then
                                 if Keypicker.HasCallback then
-                                    Keypicker.Callback(not TE.Value)
-                                else
-                                    TE.Value = not TE.Value
+                                    Keypicker.Callback(KeyIsActive)
+                                elseif TE.Value ~= KeyIsActive then
+                                    TE.Value = KeyIsActive
                                     TE:SyncFlag()
                                     TE.Callback(TE.Value)
                                 end
-                            else
-                                Keypicker.ToggledState = not (Keypicker.ToggledState or false)
-                                if Keypicker.HasCallback then
-                                    Keypicker.Callback(Keypicker.ToggledState)
-                                end
-                            end
-                            Keypicker.PrevPressed = true
-                        elseif not KeyIsActive then
-                            Keypicker.PrevPressed = false
-                        end
-
-                    elseif Keypicker.Mode == "Hold" then
-                        if TE then
-                            if Keypicker.HasCallback then
+                            elseif Keypicker.HasCallback then
                                 Keypicker.Callback(KeyIsActive)
-                            elseif TE.Value ~= KeyIsActive then
-                                TE.Value = KeyIsActive
-                                TE:SyncFlag()
-                                TE.Callback(TE.Value)
                             end
-                        elseif Keypicker.HasCallback then
-                            Keypicker.Callback(KeyIsActive)
                         end
                     end
                 end
-            end
-        end)
+            end)
+        end
 
         return Window
     end
@@ -2647,6 +2966,9 @@ local Library do
             function MenuKP:SyncFlag()
                 OrigSync(self)
                 MainWin.MenuToggleKey = self.BoundKey
+                -- The new key is still held when it gets bound; treat it as
+                -- already pressed so binding it doesn't hide the menu.
+                Library.MasterPrevState = true
             end
             MainWin.MenuToggleKey = MenuKP.BoundKey
         end
@@ -2715,7 +3037,7 @@ local Library do
 
             if #State.List == 0 then
                 local Bounds = GetTextBounds("No configs saved", 13)
-                DrawText(X + MathFloor((W - Bounds.X) / 2), Y + MathFloor((BoxH - Bounds.Y) / 2), 14, Theme["Dim"], "No configs saved")
+                DrawText(X + MathFloor((W - Bounds.X) / 2), Y + MathFloor((BoxH - Bounds.Y) / 2), 13, Theme["Dim"], "No configs saved")
                 return
             end
 
@@ -2814,19 +3136,17 @@ local Library do
         local Height = Pad + ButtonSize + Pad + 4
 
         Library.NavigationBarData = {
-            X = Library.Viewport.X / 2 - Width / 2,
+            -- Whole pixels, so the buttons and their text snap to the same grid.
+            X = MathFloor(Library.Viewport.X / 2 - Width / 2),
             Y = 40,
             Width = Width,
             Height = Height,
             Buttons = {
-                { Icon = Library.Icons.Home,   Window = Main },
-                { Icon = Library.Icons.Style,  Window = Style },
-                { Icon = Library.Icons.Config, Window = Configuration },
+                { Label = "M", Window = Main },
+                { Label = "S", Window = Style },
+                { Label = "C", Window = Configuration },
             },
         }
-
-        -- The icon Image objects are created lazily (and rebuilt on colour change)
-        -- by the render loop; see the NavigationBar section of the render loop.
     end
 
     -- // Watermark \\ --
@@ -2846,7 +3166,9 @@ local Library do
         if not WM or not WM.Visible then return end
 
         local Text = WM.Name .. "  |  " .. MathFloor(get_overlay_fps()) .. " FPS"
-        local Bounds = GetTextBounds(Text)
+        -- Sized from the text with every digit as "0", so the box only changes
+        -- width when the FPS gains or loses a digit, not on every update.
+        local Bounds = GetTextBounds((Text:gsub("%d", "0")))
         local Width = MathCeil(Bounds.X) + 20
         local Height = MathMax(22, MathCeil(Bounds.Y) + 10)
 
@@ -2895,14 +3217,17 @@ local Library do
 
         local Roles = { }
 
+        -- Built in a local table and swapped in at the end, so the render task
+        -- never sees a half-built list.
         local function Rebuild()
-            Data.Matching = { }
+            local Matching = { }
             for _, Entry in Roles do
                 if type(Entry.Role) == "string" and RankSet[Entry.Role:lower()] then
-                    Data.Matching[#Data.Matching + 1] = { Name = Entry.Name, Role = Entry.Role }
+                    Matching[#Matching + 1] = { Name = Entry.Name, Role = Entry.Role }
                 end
             end
-            TableSort(Data.Matching, function(A, B) return A.Name:lower() < B.Name:lower() end)
+            TableSort(Matching, function(A, B) return A.Name:lower() < B.Name:lower() end)
+            Data.Matching = Matching
         end
 
         local function ResolveRole(UserId)
@@ -3017,63 +3342,183 @@ local Library do
     Library.WindowSnapping = true
     Library.SnapGuides = nil
 
-    local RenderConnection = RunService.Render:Connect(function()
-        Library:UpdateInput()
-        Library.Input.Consumed = false
-        Library.DropdownOverlay = nil
+    -- // Drawing Loop \\ --
+    -- All Drawing object creation happens here: it keeps the scope reserve topped
+    -- up. Nothing is created while rendering.
+
+    Library.DrawingLoopRunning = true
+    Library.Unloaded = false
+
+    -- Creates at most `Budget` drawings per call. Returns true once the reserve
+    -- has reached `Target`.
+    local function FillReserve(Target, Budget)
+        for _, Kind in { "Square", "Text" } do
+            local List = Reserve[Kind]
+            while Budget > 0 and #List < Target[Kind] do
+                List[#List + 1] = MakeReserveDrawing(Kind)
+                Budget = Budget - 1
+            end
+        end
+        return #Reserve.Square >= Target.Square and #Reserve.Text >= Target.Text
+    end
+
+    -- Initial reserve, created before any rendering starts. Yields between
+    -- batches so loading doesn't hit the scheduler timeout.
+    while not FillReserve(InitialReserve, 256) do
+        task.wait(0)
+    end
+
+    task.spawn(function()
+        while Library.DrawingLoopRunning do
+            FillReserve(ReserveTarget, 32)
+            task.wait(0)
+        end
+    end)
+
+    -- // Render Tasks \\ --
+    -- Rendering runs in separate tasks instead of one handler:
+    --   * the frame task reads input, handles the menu key and hides stale scopes;
+    --   * each window renders itself in its own task;
+    --   * the overlay task renders everything that isn't part of a window.
+    -- Every task renders at most once per frame (Library.FrameId) and never yields
+    -- mid-render, so the scope stack is never shared between tasks.
+
+    local function SafeRender(Label, Callback, ...)
+        local Ok, Err = pcall(Callback, ...)
+        if not Ok then
+            ResetScopeStack()
+            Library.ResetClip()
+            print("[Interface] " .. Label .. " render error: " .. tostring(Err))
+        end
+    end
+
+    -- Frame task. Frames are paced to Library.TargetFPS: the window and overlay
+    -- tasks only render when FrameId advances, and retained drawings stay on
+    -- screen in between, so the whole interface updates ~60 times a second.
+    Library.TargetFPS = 60
+
+    task.spawn(function()
+        local NextFrameAt = 0
+        while not Library.Unloaded do
+            local Now = tick()
+            if Now < NextFrameAt then
+                task.wait(0)
+                continue
+            end
+            local Interval = 1 / Library.TargetFPS
+            -- Step the schedule forward; resync if we fell more than a frame behind.
+            NextFrameAt = (Now - NextFrameAt > Interval) and (Now + Interval) or (NextFrameAt + Interval)
+
+            Library.FrameId = Library.FrameId + 1
+            Library.FrameTime = Now
+
+            SafeRender("Frame", function()
+                Library:UpdateInput()
+                Library.Input.Consumed = false
+
+                local MainWin = Library.Windows[1]
+                if MainWin then
+                    local MenuKey = MainWin.MenuToggleKey or "RightShift"
+                    local PressedKeys = getpressedkeys() or { }
+                    local MenuKeyDown = TableFind(PressedKeys, MenuKey) ~= nil
+
+                    -- Debounced toggle: getpressedkeys can drop the key for a frame,
+                    -- which used to read as release + press and toggle straight back.
+                    -- The key must be seen released for several frames in a row, and
+                    -- toggles are at least 0.25s apart.
+                    local Now = tick()
+
+                    if MenuKeyDown then
+                        Library.MasterReleaseFrames = 0
+                    else
+                        Library.MasterReleaseFrames = (Library.MasterReleaseFrames or 0) + 1
+                    end
+
+                    if MenuKeyDown and not Library.MasterPrevState and Now - (Library.MasterLastToggle or 0) >= 0.25 then
+                        Library.MasterLastToggle = Now
+                        if Library.MasterVisible then
+                            Library.MasterSavedStates = { }
+                            for _, Window in Library.Windows do
+                                Library.MasterSavedStates[Window] = Window.Visible
+                                Window.Visible = false
+                            end
+                            Library.MasterVisible = false
+                        else
+                            for _, Window in Library.Windows do
+                                Window.Visible = Library.MasterSavedStates[Window] or false
+                            end
+                            Library.MasterVisible = true
+                        end
+                        Library.MasterPrevState = true
+                        Library.Input.FocusedTextbox = nil
+                    elseif not MenuKeyDown and Library.MasterReleaseFrames >= 3 then
+                        Library.MasterPrevState = false
+                    end
+                end
+
+                SweepScopes()
+                Library.MeasurePendingFallback()
+            end)
+
+            task.wait(0)
+        end
+    end)
+
+    local function RenderWindow(Window)
+        Library.CurrentWindowZ = Window.ZBase
         Library.SnapGuides = nil
 
-        local MainWin = Library.Windows[1]
-        if not MainWin then return end
+        WithScope(Window, Window.ZBase, Window.Render, Window)
 
-        Pool:Begin()
-
-        local MenuKey = MainWin.MenuToggleKey or "RightShift"
-        local PressedKeys = getpressedkeys() or { }
-        local MenuKeyDown = TableFind(PressedKeys, MenuKey) ~= nil
-
-        if MenuKeyDown and not Library.MasterPrevState then
-            if Library.MasterVisible then
-                Library.MasterSavedStates = { }
-                for _, Window in Library.Windows do
-                    Library.MasterSavedStates[Window] = Window.Visible
-                    Window.Visible = false
-                end
-                Library.MasterVisible = false
-            else
-                for _, Window in Library.Windows do
-                    Window.Visible = Library.MasterSavedStates[Window] or false
-                end
-                Library.MasterVisible = true
-            end
-            Library.MasterPrevState = true
-            Library.Input.FocusedTextbox = nil
-        elseif not MenuKeyDown then
-            Library.MasterPrevState = false
-        end
-
-        Library:RenderWatermark()
-        Library:RenderGroupRanked()
-
-        MainWin:RenderKeybindList()
-
-        for _, Window in Library.Windows do
-            if Window.Visible then
-                Window:Render()
-            end
-        end
-
+        -- Snap guides from dragging this window.
         if Library.SnapGuides then
+            PushScope(Window.SnapKey, Z.Snap)
             for _, G in Library.SnapGuides do
                 DrawRect(G[1], G[2], G[3], G[4], Theme["Accent"])
             end
+            PopScope()
+            Library.SnapGuides = nil
+        end
+    end
+
+    -- One task per window, started when the window is created.
+    function Library.StartWindowTask(Window)
+        task.spawn(function()
+            local LastFrame = -1
+            while not Library.Unloaded do
+                if Library.FrameId ~= LastFrame then
+                    LastFrame = Library.FrameId
+                    if Window.Visible then
+                        SafeRender(Window.Name, RenderWindow, Window)
+                    end
+                end
+                task.wait(0)
+            end
+        end)
+    end
+
+    for _, Window in Library.Windows do
+        Library.StartWindowTask(Window)
+    end
+
+    local function RenderOverlays()
+        local MainWin = Library.Windows[1]
+        if not MainWin then return end
+
+        WithScope("Watermark", Z.Watermark, Library.RenderWatermark, Library)
+        WithScope("GroupRanked", Z.GroupRanked, Library.RenderGroupRanked, Library)
+        WithScope("KeybindList", Z.KeybindList, MainWin.RenderKeybindList, MainWin)
+
+        for Index, Window in Library.Windows do
+            Window.NotifyKey = Window.NotifyKey or { }
+            WithScope(Window.NotifyKey, Z.Notifications + Index * 1000, Window.RenderNotifications, Window)
         end
 
-        for _, Window in Library.Windows do
-            Window:RenderNotifications()
-        end
+        WithScope("KeyPickerContext", Z.ContextMenu, Library.RenderKeyPickerContext, Library)
+        WithScope("ColorPicker", Z.ColorPicker, Library.RenderColorPicker, Library)
 
         if Library.NavigationBarData and Library.MasterVisible then
+            PushScope(Library.NavigationBarData, Z.NavBar)
             local NB = Library.NavigationBarData
             local BtnSize = 28
             local BtnGap = 3
@@ -3092,63 +3537,64 @@ local Library do
                     Active and Theme["Accent"] or Theme["Border"],
                     Active and Theme["Accent"] or (Hovered and Theme["Dark Background"] or Theme["Background"]))
 
-                local IconPad = 6
-                local IW = BtnSize - IconPad * 2
-                local IH = IW
-
-                local IconColor = Active and Theme["White"] or (Hovered and Theme["Accent"] or Theme["Dim"])
-
-                if not Btn._Drawing or Btn._IconColor ~= IconColor then
-                    if Btn._Drawing then Btn._Drawing:Remove() end
-                    Btn._Drawing = NewDrawing("Image", {
-                        Visible = true,
-                        Position = Vector2New(BX + IconPad, BY + IconPad),
-                        Size = Vector2New(IW, IH),
-                        Data = Btn.Icon,
-                        Color = IconColor,
-                        Opacity = 1,
-                        ZIndex = 10000,
-                    })
-                    Btn._IconColor = IconColor
-                end
+                local LabelColor = Active and Theme["White"] or (Hovered and Theme["Accent"] or Theme["Dim"])
+                -- Centred on the button, rounded to the nearest whole pixel.
+                local LabelBounds = GetTextBounds(Btn.Label)
+                DrawText(BX + MathFloor((BtnSize - LabelBounds.X) / 2 + 0.5), BY + MathFloor((BtnSize - LabelBounds.Y) / 2 + 0.5),
+                    Library.FontSize, LabelColor, Btn.Label)
 
                 if Library.Input.MouseClicked and Hovered and Btn.Window then
                     Library.Input.Consumed = true
-                    Btn.Window.Visible = not Btn.Window.Visible
+                    -- Cooldown so spam-clicking can't toggle a whole window's worth
+                    -- of drawings on and off every frame.
+                    local Now = tick()
+                    if Now - (Btn._LastToggle or 0) >= 0.25 then
+                        Btn._LastToggle = Now
+                        Btn.Window.Visible = not Btn.Window.Visible
+                    end
                 end
             end
-        elseif Library.NavigationBarData then
-            for _, Btn in Library.NavigationBarData.Buttons do
-                if Btn._Drawing then
-                    Btn._Drawing:Remove()
-                    Btn._Drawing = nil
-                    Btn._IconColor = nil
-                end
-            end
+            PopScope()
         end
+    end
 
-        Pool:Finish()
+    -- Text measuring via DrawingImmediate (see "Text Measuring" above). This
+    -- touches no instances, so it's allowed inside Render.
+    RunService.Render:Connect(function()
+        if Library.Unloaded then return end
+        Library.MeasurePendingImmediate()
+    end)
+
+    -- Overlay task
+    task.spawn(function()
+        local LastFrame = -1
+        while not Library.Unloaded do
+            if Library.FrameId ~= LastFrame then
+                LastFrame = Library.FrameId
+                SafeRender("Overlay", RenderOverlays)
+            end
+            task.wait(0)
+        end
     end)
 
     function Library:Unload()
-        if RenderConnection then
-            RenderConnection:Disconnect()
-            RenderConnection = nil
-        end
-        for _, Square in Pool.Squares do Square:Remove() end
-        for _, Object in Pool.Texts do Object:Remove() end
-        for _, Image in Pool.Images do Image:Remove() end
-        Pool.Squares, Pool.SquareCount = { }, 0
-        Pool.Texts, Pool.TextCount = { }, 0
-        Pool.Images, Pool.ImageCount = { }, 0
+        Library.Unloaded = true
+        Library.DrawingLoopRunning = false
 
-        if Library.NavigationBarData and Library.NavigationBarData.Buttons then
-            for _, Btn in ipairs(Library.NavigationBarData.Buttons) do
-                if Btn._Drawing then
-                    Btn._Drawing:Remove()
-                    Btn._Drawing = nil
-                end
-            end
+        for _, Scope in ScopeList do
+            for _, Object in Scope.Squares do Object:Remove() end
+            for _, Object in Scope.Texts do Object:Remove() end
+        end
+        table.clear(Scopes)
+        ScopeList = { }
+
+        for _, Kind in { "Square", "Text" } do
+            for _, Object in Reserve[Kind] do Object:Remove() end
+            Reserve[Kind] = { }
+        end
+
+        for _, Measurer in Measurers do
+            Measurer.Object:Remove()
         end
     end
 end
