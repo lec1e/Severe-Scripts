@@ -537,12 +537,16 @@ local Library do
     function Library.MeasurePendingImmediate()
         if ImmediateFailed or PendingCount == 0 then return end
 
+        local Budget = 48
         for Key, Job in PendingMeasure do
+            if Budget <= 0 then
+                break
+            end
+            Budget = Budget - 1
             local Ok, Bounds = pcall(ImmediateMeasure, Job[1], Job[2], Job[3])
             if Ok and ValidBounds(Bounds, Job[3]) then
                 StoreBounds(Key, Job, Vector2New(Bounds.X, Bounds.Y))
             else
-                -- Not usable here; switch to the Text-object measurers for good.
                 ImmediateFailed = true
                 return
             end
@@ -627,17 +631,23 @@ local Library do
     end
 
     local function TruncateText(Text, MaxWidth, Size)
+        Text = tostring(Text or "")
         if GetTextBounds(Text, Size).X <= MaxWidth then
             return Text
         end
-        local Truncated = Text
-        while #Truncated > 0 do
-            Truncated = Truncated:sub(1, -2)
-            if GetTextBounds(Truncated .. "...", Size).X <= MaxWidth then
-                return Truncated .. "..."
+        local Lo, Hi = 0, #Text
+        local Best = "..."
+        while Lo <= Hi do
+            local Mid = MathFloor((Lo + Hi) / 2)
+            local Candidate = Text:sub(1, Mid) .. "..."
+            if GetTextBounds(Candidate, Size).X <= MaxWidth then
+                Best = Candidate
+                Lo = Mid + 1
+            else
+                Hi = Mid - 1
             end
         end
-        return "..."
+        return Best
     end
 
     -- // Library Helpers \\ --
@@ -693,19 +703,61 @@ local Library do
         return Hue, Saturation, Value
     end
 
+    local PressedKeysCache, PressedKeysAt = { }, 0
+
+    local function GetPressedKeys()
+        local Now = tick()
+        if Now - PressedKeysAt < 0.01 then
+            return PressedKeysCache
+        end
+        PressedKeysAt = Now
+        local Ok, Keys = pcall(getpressedkeys)
+        PressedKeysCache = (Ok and type(Keys) == "table") and Keys or { }
+        return PressedKeysCache
+    end
+
+    local function MouseButtonDown(Fn)
+        if type(Fn) ~= "function" then
+            return false
+        end
+        local Ok, Value = pcall(Fn)
+        return Ok and (Value == true or Value == "true")
+    end
+
     function Library:UpdateInput()
         local Input = self.Input
+        local Now = tick()
+        if Now - (self._ViewportAt or 0) > 0.25 then
+            self._ViewportAt = Now
+            local OkView, View = pcall(function()
+                return self.Camera.ViewportSize * self.DPIScale
+            end)
+            if OkView and View then
+                self.Viewport = View
+            end
+        end
 
-        self.Viewport = self.Camera.ViewportSize * self.DPIScale
+        local Mouse
+        local OkMouse, Pos = pcall(getmouseposition)
+        if OkMouse and Pos then
+            Mouse = Pos
+        else
+            pcall(function()
+                Mouse = UserInputService:GetMouseLocation()
+            end)
+        end
+        Input.Mouse = Mouse
+        local Scale = self.DPIScale or 1
+        Input.MouseX = ((Mouse and (Mouse.X or Mouse.x)) or 0) * Scale
+        Input.MouseY = ((Mouse and (Mouse.Y or Mouse.y)) or 0) * Scale
 
-        Input.Mouse = UserInputService:GetMouseLocation()
-        Input.MouseX = Input.Mouse.X * self.DPIScale
-        Input.MouseY = Input.Mouse.Y * self.DPIScale
-        Input.MouseClicked = isleftpressed() and not Input.MousePrevious
-        Input.RightClicked = isrightpressed() and not Input.RightPrevious
-        Input.MouseDown = isleftpressed()
-        Input.MousePrevious = isleftpressed()
-        Input.RightPrevious = isrightpressed()
+        local LeftDown = MouseButtonDown(isleftpressed)
+        local RightDown = MouseButtonDown(isrightpressed)
+        Input.MouseClicked = LeftDown and not Input.MousePrevious
+        Input.RightClicked = RightDown and not Input.RightPrevious
+        Input.MouseDown = LeftDown
+        Input.MousePrevious = LeftDown
+        Input.RightPrevious = RightDown
     end
 
     function Library:IsHovering(X, Y, Width, Height)
@@ -1315,7 +1367,8 @@ local Library do
             end
 
             if IsFocused then
-                for _, Key in getpressedkeys() do
+                local Keys = GetPressedKeys()
+                for _, Key in Keys do
                     if not TableFind(self.PrevKeys, Key) then
                         if Key == "Enter" then
                             Library.Input.FocusedTextbox = nil
@@ -1332,7 +1385,7 @@ local Library do
                         end
                     end
                 end
-                self.PrevKeys = getpressedkeys() or { }
+                self.PrevKeys = Keys
             end
         end
 
@@ -1432,7 +1485,9 @@ local Library do
         local Padding = Library.Layout.SectionInnerPadding
         local HeaderHeight = Library.Layout.SectionHeaderHeight
 
-        self.Height = self:GetContentHeight()
+        if type(self.Height) ~= "number" or self.Height <= 0 then
+            self.Height = self:GetContentHeight()
+        end
 
         DrawRect(X, Y, Width, self.Height, Theme["Border"])
         DrawRect(X + 1, Y + 1, Width - 2, self.Height - 2, Theme["Black"])
@@ -1738,6 +1793,7 @@ local Library do
                     Offset = Offset + Gap
                 end
                 local SecHeight = SectionHeight(Section)
+                Section.Height = SecHeight
                 Layout[#Layout + 1] = { Section = Section, Col = Col, Offset = Offset }
                 ColumnHeight[Col] = Offset + SecHeight
             end
@@ -1953,7 +2009,7 @@ local Library do
             return ProposedX, ProposedY
         end
 
-        local Pressed = getpressedkeys() or { }
+        local Pressed = GetPressedKeys()
         if TableFind(Pressed, "LeftAlt") or TableFind(Pressed, "RightAlt") then
             return ProposedX, ProposedY
         end
@@ -2342,7 +2398,7 @@ local Library do
             RunService.PostLocal:Connect(function()
                 if Library.Unloaded then return end
 
-                local PressedKeys = getpressedkeys() or { }
+                local PressedKeys = GetPressedKeys()
                 local function IsKeyPressed(Target) return TableFind(PressedKeys, Target) ~= nil end
 
                 if Library.CapturingKeyPicker then
@@ -3233,8 +3289,20 @@ local Library do
         local function ResolveRole(UserId)
             local Url = StringFormat("https://groups.roblox.com/v1/users/%d/groups/roles", UserId)
 
-            local Ok, Body = pcall(function() return game:HttpGet(Url) end)
-            if not Ok or type(Body) ~= "string" then return nil end
+            local Ok, Body = pcall(function()
+                if type(http) == "table" and type(http.get) == "function" then
+                    return http.get(Url)
+                end
+                return game:HttpGet(Url)
+            end)
+            if Ok and type(Body) == "buffer" then
+                local OkText, Text = pcall(buffer.tostring, Body)
+                if OkText then
+                    Body = Text
+                end
+            end
+
+            if type(Body) ~= "string" then return nil end
 
             local Decoded
             Ok, Decoded = pcall(function() return crypt.json.decode(Body) end)
@@ -3251,16 +3319,28 @@ local Library do
         task.spawn(function()
             while Library.GroupRankedData == Data do
                 local Present = { }
-                for _, Player in Players:GetChildren() do
-                    local Id = Player.UserId
-                    Present[Id] = true
-                    local Entry = Roles[Id]
-                    if Entry then
-                        Entry.Name = Player.Name
-                    else
-                        Roles[Id] = { Name = Player.Name, Role = ResolveRole(Id) or false }
-                        Rebuild()
-                        task.wait(0.1)
+                local Ok, List = pcall(function()
+                    return Players:GetPlayers()
+                end)
+                if not Ok or type(List) ~= "table" then
+                    Ok, List = pcall(function()
+                        return Players:GetChildren()
+                    end)
+                end
+                if Ok and type(List) == "table" then
+                    for _, Player in List do
+                        if Player and Player.ClassName == "Player" then
+                            local Id = Player.UserId
+                            Present[Id] = true
+                            local Entry = Roles[Id]
+                            if Entry then
+                                Entry.Name = Player.Name
+                            else
+                                Roles[Id] = { Name = Player.Name, Role = ResolveRole(Id) or false }
+                                Rebuild()
+                                task.wait(0.15)
+                            end
+                        end
                     end
                 end
 
@@ -3269,7 +3349,7 @@ local Library do
                 end
 
                 Rebuild()
-                task.wait(2)
+                task.wait(3)
             end
         end)
 
@@ -3370,8 +3450,8 @@ local Library do
 
     task.spawn(function()
         while Library.DrawingLoopRunning do
-            FillReserve(ReserveTarget, 32)
-            task.wait(0)
+            local Full = FillReserve(ReserveTarget, 32)
+            task.wait(Full and 0.4 or 0.08)
         end
     end)
 
@@ -3392,77 +3472,9 @@ local Library do
         end
     end
 
-    -- Frame task. Frames are paced to Library.TargetFPS: the window and overlay
-    -- tasks only render when FrameId advances, and retained drawings stay on
-    -- screen in between, so the whole interface updates ~60 times a second.
+    -- One sequential render loop. Separate wait(0) tasks used to spin the
+    -- scheduler; input, windows and overlays now run in order on a paced tick.
     Library.TargetFPS = 60
-
-    task.spawn(function()
-        local NextFrameAt = 0
-        while not Library.Unloaded do
-            local Now = tick()
-            if Now < NextFrameAt then
-                task.wait(0)
-                continue
-            end
-            local Interval = 1 / Library.TargetFPS
-            -- Step the schedule forward; resync if we fell more than a frame behind.
-            NextFrameAt = (Now - NextFrameAt > Interval) and (Now + Interval) or (NextFrameAt + Interval)
-
-            Library.FrameId = Library.FrameId + 1
-            Library.FrameTime = Now
-
-            SafeRender("Frame", function()
-                Library:UpdateInput()
-                Library.Input.Consumed = false
-
-                local MainWin = Library.Windows[1]
-                if MainWin then
-                    local MenuKey = MainWin.MenuToggleKey or "RightShift"
-                    local PressedKeys = getpressedkeys() or { }
-                    local MenuKeyDown = TableFind(PressedKeys, MenuKey) ~= nil
-
-                    -- Debounced toggle: getpressedkeys can drop the key for a frame,
-                    -- which used to read as release + press and toggle straight back.
-                    -- The key must be seen released for several frames in a row, and
-                    -- toggles are at least 0.25s apart.
-                    local Now = tick()
-
-                    if MenuKeyDown then
-                        Library.MasterReleaseFrames = 0
-                    else
-                        Library.MasterReleaseFrames = (Library.MasterReleaseFrames or 0) + 1
-                    end
-
-                    if MenuKeyDown and not Library.MasterPrevState and Now - (Library.MasterLastToggle or 0) >= 0.25 then
-                        Library.MasterLastToggle = Now
-                        if Library.MasterVisible then
-                            Library.MasterSavedStates = { }
-                            for _, Window in Library.Windows do
-                                Library.MasterSavedStates[Window] = Window.Visible
-                                Window.Visible = false
-                            end
-                            Library.MasterVisible = false
-                        else
-                            for _, Window in Library.Windows do
-                                Window.Visible = Library.MasterSavedStates[Window] or false
-                            end
-                            Library.MasterVisible = true
-                        end
-                        Library.MasterPrevState = true
-                        Library.Input.FocusedTextbox = nil
-                    elseif not MenuKeyDown and Library.MasterReleaseFrames >= 3 then
-                        Library.MasterPrevState = false
-                    end
-                end
-
-                SweepScopes()
-                Library.MeasurePendingFallback()
-            end)
-
-            task.wait(0)
-        end
-    end)
 
     local function RenderWindow(Window)
         Library.CurrentWindowZ = Window.ZBase
@@ -3482,23 +3494,7 @@ local Library do
     end
 
     -- One task per window, started when the window is created.
-    function Library.StartWindowTask(Window)
-        task.spawn(function()
-            local LastFrame = -1
-            while not Library.Unloaded do
-                if Library.FrameId ~= LastFrame then
-                    LastFrame = Library.FrameId
-                    if Window.Visible then
-                        SafeRender(Window.Name, RenderWindow, Window)
-                    end
-                end
-                task.wait(0)
-            end
-        end)
-    end
-
-    for _, Window in Library.Windows do
-        Library.StartWindowTask(Window)
+    function Library.StartWindowTask()
     end
 
     local function RenderOverlays()
@@ -3565,15 +3561,63 @@ local Library do
         Library.MeasurePendingImmediate()
     end)
 
-    -- Overlay task
     task.spawn(function()
-        local LastFrame = -1
         while not Library.Unloaded do
-            if Library.FrameId ~= LastFrame then
-                LastFrame = Library.FrameId
+            local Now = tick()
+            Library.FrameId = Library.FrameId + 1
+            Library.FrameTime = Now
+
+            SafeRender("Frame", function()
+                Library:UpdateInput()
+                Library.Input.Consumed = false
+
+                local MainWin = Library.Windows[1]
+                if MainWin then
+                    local MenuKey = MainWin.MenuToggleKey or "RightShift"
+                    local PressedKeys = GetPressedKeys()
+                    local MenuKeyDown = TableFind(PressedKeys, MenuKey) ~= nil
+
+                    if MenuKeyDown then
+                        Library.MasterReleaseFrames = 0
+                    else
+                        Library.MasterReleaseFrames = (Library.MasterReleaseFrames or 0) + 1
+                    end
+
+                    if MenuKeyDown and not Library.MasterPrevState and Now - (Library.MasterLastToggle or 0) >= 0.25 then
+                        Library.MasterLastToggle = Now
+                        if Library.MasterVisible then
+                            Library.MasterSavedStates = { }
+                            for _, Window in Library.Windows do
+                                Library.MasterSavedStates[Window] = Window.Visible
+                                Window.Visible = false
+                            end
+                            Library.MasterVisible = false
+                        else
+                            for _, Window in Library.Windows do
+                                Window.Visible = Library.MasterSavedStates[Window] or false
+                            end
+                            Library.MasterVisible = true
+                        end
+                        Library.MasterPrevState = true
+                        Library.Input.FocusedTextbox = nil
+                    elseif not MenuKeyDown and Library.MasterReleaseFrames >= 3 then
+                        Library.MasterPrevState = false
+                    end
+                end
+
+                for _, Window in Library.Windows do
+                    if Window.Visible then
+                        SafeRender(Window.Name, RenderWindow, Window)
+                    end
+                end
                 SafeRender("Overlay", RenderOverlays)
-            end
-            task.wait(0)
+                SweepScopes()
+                Library.MeasurePendingFallback()
+            end)
+
+            local Interval = 1 / (Library.TargetFPS or 60)
+            local Spent = tick() - Now
+            task.wait(MathMax(0, Interval - Spent))
         end
     end)
 
